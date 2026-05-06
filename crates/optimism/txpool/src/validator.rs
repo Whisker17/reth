@@ -1,9 +1,9 @@
-use crate::{supervisor::SupervisorClient, InvalidCrossTx, OpPooledTx};
-use alloy_consensus::{BlockHeader, Transaction};
+use crate::{error::MetaTxDisabled, supervisor::SupervisorClient, InvalidCrossTx, OpPooledTx};
+use alloy_consensus::{constants::LEGACY_TX_TYPE_ID, BlockHeader, Transaction};
 use op_revm::L1BlockInfo;
 use parking_lot::RwLock;
 use reth_chainspec::ChainSpecProvider;
-use reth_mantle_forks::MantleHardforks;
+use reth_mantle_forks::{is_mantle_meta_tx, MantleHardforks};
 use reth_optimism_evm::RethL1BlockInfo;
 use reth_optimism_forks::OpHardforks;
 use reth_primitives_traits::{
@@ -18,6 +18,7 @@ use std::sync::{
     atomic::{AtomicBool, AtomicU64, Ordering},
     Arc,
 };
+use tracing::trace;
 
 /// The interval for which we check transaction against supervisor, 1 hour.
 const TRANSACTION_VALIDITY_WINDOW_SECS: u64 = 3600;
@@ -186,6 +187,45 @@ where
             return TransactionValidationOutcome::Invalid(
                 transaction,
                 InvalidTransactionError::TxTypeNotSupported.into(),
+            );
+        }
+
+        // Reject unprotected (non-EIP-155) legacy transactions.
+        //
+        // Legacy transactions signed without replay protection (v=27/28) carry no chain ID
+        // in the signature and can be replayed on any chain.
+        //
+        // op-geth rejects these by default at the RPC layer (`AllowUnprotectedTxs=false`
+        // in `internal/ethapi/api.go:SubmitTransaction`). We enforce the same rule here
+        // at the txpool validation layer to cover both RPC and P2P ingestion paths.
+        //
+        // EIP-155 signed txs (chain_id = Some(_)) and all typed txs (EIP-2930/1559/7702)
+        // are unaffected — they always carry a chain ID.
+        if transaction.ty() == LEGACY_TX_TYPE_ID && transaction.chain_id().is_none() {
+            trace!(
+                target: "txpool",
+                tx_hash = %transaction.hash(),
+                "rejected unprotected (non-EIP-155) legacy transaction"
+            );
+            return TransactionValidationOutcome::Invalid(
+                transaction,
+                InvalidPoolTransactionError::other(crate::error::UnprotectedTxDisabled),
+            );
+        }
+
+        // Reject Mantle MetaTx (disabled since MantleEverest hardfork).
+        // MetaTx was a gas sponsorship mechanism where the tx input starts with a
+        // 32-byte "MantleMetaTxPrefix". It is permanently disabled on all chains.
+        // Mirrors op-geth: core/types/meta_transaction.go — MetaTxCheck()
+        if is_mantle_meta_tx(transaction.input()) {
+            trace!(
+                target: "txpool",
+                tx_hash = %transaction.hash(),
+                "rejected MetaTx (permanently disabled since MantleEverest)"
+            );
+            return TransactionValidationOutcome::Invalid(
+                transaction,
+                InvalidPoolTransactionError::other(MetaTxDisabled),
             );
         }
 
