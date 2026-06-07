@@ -257,6 +257,8 @@ jobs:
             git switch -C "$BRANCH_NAME" "origin/${BASE_BRANCH}"
           fi
 
+          git checkout "origin/${BASE_BRANCH}" -- .op-reth-base-tag
+
           OUT_OF_SCOPE_OP_RETH_PATHS=(
             op-reth/.config
             op-reth/dprint.json
@@ -360,8 +362,6 @@ jobs:
             fi
           done < <(sort -u /tmp/files-old.txt /tmp/files-new.txt /tmp/files-local.txt)
 
-          echo "$NEW_TAG" > .op-reth-base-tag
-
           marker_conflicts="$(wc -l < /tmp/patch-conflicts.txt | tr -d ' ')"
           manual_info_conflicts="$(wc -l < /tmp/manual-conflicts-info.txt | tr -d ' ')"
           manual_unresolved_conflicts="$(wc -l < /tmp/manual-conflicts-unresolved.txt | tr -d ' ')"
@@ -369,7 +369,7 @@ jobs:
           echo "::notice::Three-way merge complete: ${marker_conflicts} marker conflict(s), ${manual_info_conflicts} auto-resolved conflict(s), ${manual_unresolved_conflicts} unresolved manual conflict(s)"
 
           if [ "$total_blocking_conflicts" -eq 0 ]; then
-            git add op-reth/bin/ op-reth/crates/ .op-reth-base-tag
+            git add op-reth/bin/ op-reth/crates/
             commit_staged_if_needed "deps: sync op-reth from ${OLD_TAG} to ${NEW_TAG} (${DATE})" || true
             sync_committed=true
           else
@@ -540,11 +540,11 @@ jobs:
             if [ "$has_unresolved_conflicts" = "true" ] || [ "$has_unresolved_manual_conflicts" = "true" ]; then
               validation_status="failed"
               write_conflict_report
-              git add op-reth/bin/ op-reth/crates/ mantle-reth/ patches/ .op-reth-base-tag Cargo.toml Cargo.lock "$CONFLICT_REPORT"
+              git add op-reth/bin/ op-reth/crates/ mantle-reth/ patches/ Cargo.toml Cargo.lock "$CONFLICT_REPORT"
               commit_staged_if_needed "wip: unresolved op-reth sync conflicts from ${OLD_TAG} to ${NEW_TAG} (${DATE})" || true
               sync_committed="wip"
             else
-              git add op-reth/bin/ op-reth/crates/ mantle-reth/ patches/ .op-reth-base-tag Cargo.toml Cargo.lock
+              git add op-reth/bin/ op-reth/crates/ mantle-reth/ patches/ Cargo.toml Cargo.lock
               commit_staged_if_needed "deps: sync op-reth from ${OLD_TAG} to ${NEW_TAG} (${DATE})" || true
               sync_committed=true
             fi
