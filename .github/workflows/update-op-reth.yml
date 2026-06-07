@@ -91,7 +91,8 @@ jobs:
           mkdir -p "$ARTIFACT_DIR"
           rm -f "$CONFLICT_REPORT"
           > /tmp/patch-conflicts.txt
-          > /tmp/manual-conflicts.txt
+          > /tmp/manual-conflicts-info.txt
+          > /tmp/manual-conflicts-unresolved.txt
           > /tmp/compat-report.txt
 
           validation_status="failed"
@@ -99,7 +100,8 @@ jobs:
           rev_extraction_failed=false
           lock_update_failed=false
           has_unresolved_conflicts=false
-          has_manual_conflicts=false
+          has_unresolved_manual_conflicts=false
+          has_manual_info=false
           sync_committed=false
           pr_url=""
           pr_number=""
@@ -167,21 +169,30 @@ jobs:
                 echo '```'
                 echo
               fi
-              if [ -s /tmp/manual-conflicts.txt ]; then
-                echo "## Manual Conflicts"
+              if [ -s /tmp/manual-conflicts-unresolved.txt ]; then
+                echo "## Manual Conflicts (requires resolution)"
                 echo
                 echo '```'
-                cat /tmp/manual-conflicts.txt
+                cat /tmp/manual-conflicts-unresolved.txt
                 echo '```'
                 echo
               fi
-              echo "Before this PR can be marked ready, resolve the files above and remove this report."
+              if [ -s /tmp/manual-conflicts-info.txt ]; then
+                echo "## Auto-Resolved Structural Changes (review recommended)"
+                echo
+                echo '```'
+                cat /tmp/manual-conflicts-info.txt
+                echo '```'
+                echo
+              fi
+              echo "Before this PR can be marked ready, resolve the blocking conflicts above, review any auto-resolved structural changes, and remove this report."
             } > "$CONFLICT_REPORT"
           }
 
           build_artifacts() {
             cp /tmp/patch-conflicts.txt "$ARTIFACT_DIR/patch-conflicts.txt" 2>/dev/null || true
-            cp /tmp/manual-conflicts.txt "$ARTIFACT_DIR/manual-conflicts.txt" 2>/dev/null || true
+            cp /tmp/manual-conflicts-info.txt "$ARTIFACT_DIR/manual-conflicts-info.txt" 2>/dev/null || true
+            cp /tmp/manual-conflicts-unresolved.txt "$ARTIFACT_DIR/manual-conflicts-unresolved.txt" 2>/dev/null || true
             cp /tmp/compat-report.txt "$ARTIFACT_DIR/compat-report.md" 2>/dev/null || true
             cp /tmp/pr-body.txt "$ARTIFACT_DIR/pr-body.md" 2>/dev/null || true
             git diff --binary > "$ARTIFACT_DIR/worktree.diff" || true
@@ -277,7 +288,7 @@ jobs:
 
             if [ -e "$OLD" ] && [ ! -e "$NEW" ]; then
               if [ -e "$LOCAL" ] && ! diff -q "$LOCAL" "$OLD" >/dev/null 2>&1; then
-                echo "$LOCAL (upstream deleted, local modified)" >> /tmp/manual-conflicts.txt
+                echo "$LOCAL (upstream deleted, local modified)" >> /tmp/manual-conflicts-info.txt
               elif [ -e "$LOCAL" ]; then
                 rm -f "$LOCAL"
               fi
@@ -288,7 +299,7 @@ jobs:
               mkdir -p "$(dirname "$LOCAL")"
               cp -a "$NEW" "$LOCAL"
               if ! diff -q "$OLD" "$NEW" >/dev/null 2>&1; then
-                echo "$LOCAL (local deleted, upstream modified; took upstream)" >> /tmp/manual-conflicts.txt
+                echo "$LOCAL (local deleted, upstream modified; took upstream)" >> /tmp/manual-conflicts-info.txt
               fi
               continue
             fi
@@ -301,7 +312,7 @@ jobs:
               if diff -q "$LOCAL" "$OLD" >/dev/null 2>&1; then
                 cp -a "$NEW" "$LOCAL"
               else
-                echo "$LOCAL (binary conflict: local and upstream both modified)" >> /tmp/manual-conflicts.txt
+                echo "$LOCAL (binary conflict: local and upstream both modified)" >> /tmp/manual-conflicts-unresolved.txt
               fi
               continue
             fi
@@ -314,18 +325,19 @@ jobs:
             if [ "$merge_exit" -gt 0 ] && [ "$merge_exit" -lt 128 ]; then
               echo "$LOCAL" >> /tmp/patch-conflicts.txt
             elif [ "$merge_exit" -ge 128 ]; then
-              echo "$LOCAL (merge-file error, exit $merge_exit)" >> /tmp/manual-conflicts.txt
+              echo "$LOCAL (merge-file error, exit $merge_exit)" >> /tmp/manual-conflicts-unresolved.txt
             fi
           done < <(sort -u /tmp/files-old.txt /tmp/files-new.txt /tmp/files-local.txt)
 
           echo "$NEW_TAG" > .op-reth-base-tag
 
           marker_conflicts="$(wc -l < /tmp/patch-conflicts.txt | tr -d ' ')"
-          manual_conflicts="$(wc -l < /tmp/manual-conflicts.txt | tr -d ' ')"
-          total_conflicts=$((marker_conflicts + manual_conflicts))
-          echo "::notice::Three-way merge complete: ${marker_conflicts} marker conflict(s), ${manual_conflicts} manual conflict(s)"
+          manual_info_conflicts="$(wc -l < /tmp/manual-conflicts-info.txt | tr -d ' ')"
+          manual_unresolved_conflicts="$(wc -l < /tmp/manual-conflicts-unresolved.txt | tr -d ' ')"
+          total_blocking_conflicts=$((marker_conflicts + manual_unresolved_conflicts))
+          echo "::notice::Three-way merge complete: ${marker_conflicts} marker conflict(s), ${manual_info_conflicts} auto-resolved conflict(s), ${manual_unresolved_conflicts} unresolved manual conflict(s)"
 
-          if [ "$total_conflicts" -eq 0 ]; then
+          if [ "$total_blocking_conflicts" -eq 0 ]; then
             git add op-reth/ .op-reth-base-tag
             commit_staged_if_needed "deps: sync op-reth from ${OLD_TAG} to ${NEW_TAG} (${DATE})" || true
             sync_committed=true
@@ -477,14 +489,17 @@ jobs:
             has_unresolved_conflicts=false
           fi
 
-          if [ -s /tmp/manual-conflicts.txt ]; then
-            has_manual_conflicts=true
+          if [ -s /tmp/manual-conflicts-unresolved.txt ]; then
+            has_unresolved_manual_conflicts=true
           else
-            has_manual_conflicts=false
+            has_unresolved_manual_conflicts=false
+          fi
+          if [ -s /tmp/manual-conflicts-info.txt ]; then
+            has_manual_info=true
           fi
 
           if [ "$sync_committed" != "true" ]; then
-            if [ "$has_unresolved_conflicts" = "true" ] || [ "$has_manual_conflicts" = "true" ]; then
+            if [ "$has_unresolved_conflicts" = "true" ] || [ "$has_unresolved_manual_conflicts" = "true" ]; then
               validation_status="failed"
               write_conflict_report
               git add op-reth/ mantle-reth/ patches/ .op-reth-base-tag "$CONFLICT_REPORT"
@@ -496,7 +511,7 @@ jobs:
               sync_committed=true
             fi
           elif [ -n "$(git diff --name-only op-reth/ mantle-reth/ patches/)" ]; then
-            if [ "$has_unresolved_conflicts" = "true" ] || [ "$has_manual_conflicts" = "true" ]; then
+            if [ "$has_unresolved_conflicts" = "true" ] || [ "$has_unresolved_manual_conflicts" = "true" ]; then
               validation_status="failed"
               write_conflict_report
               git add op-reth/ mantle-reth/ patches/ "$CONFLICT_REPORT"
@@ -529,7 +544,7 @@ jobs:
           fi
           set -e
 
-          if [ "$rev_extraction_failed" = "true" ] || [ "$has_unresolved_conflicts" = "true" ] || [ "$has_manual_conflicts" = "true" ]; then
+          if [ "$rev_extraction_failed" = "true" ] || [ "$has_unresolved_conflicts" = "true" ] || [ "$has_unresolved_manual_conflicts" = "true" ]; then
             validation_status="failed"
           elif [ "$check_passed" -eq 0 ] && [ "$test_build_passed" -eq 0 ] && [ "$targeted_tests_passed" -eq 0 ] && [ "$integration_build_passed" -eq 0 ]; then
             validation_status="passed"
@@ -546,8 +561,8 @@ jobs:
           if [ "$has_unresolved_conflicts" = "true" ]; then
             failure_summary="${failure_summary}- unresolved merge conflict markers remain\n"
           fi
-          if [ "$has_manual_conflicts" = "true" ]; then
-            failure_summary="${failure_summary}- manual structural conflicts remain\n"
+          if [ "$has_unresolved_manual_conflicts" = "true" ]; then
+            failure_summary="${failure_summary}- unresolved manual structural conflicts remain\n"
           fi
           if [ "$check_passed" -ne 0 ]; then
             failure_summary="${failure_summary}- cargo check failed\n"
@@ -609,8 +624,11 @@ jobs:
           if [ "$has_unresolved_conflicts" = "true" ]; then
             warnings="${warnings}\n- Unresolved conflict markers remain."
           fi
-          if [ "$has_manual_conflicts" = "true" ]; then
-            warnings="${warnings}\n- Manual structural conflicts require human resolution."
+          if [ "$has_unresolved_manual_conflicts" = "true" ]; then
+            warnings="${warnings}\n- Unresolved manual structural conflicts require human resolution."
+          fi
+          if [ "$has_manual_info" = "true" ]; then
+            warnings="${warnings}\n- Auto-resolved structural conflicts present; review recommended."
           fi
           if [ "$sync_committed" != "true" ]; then
             warnings="${warnings}\n- Sync commit state: ${sync_committed}."
@@ -648,11 +666,19 @@ jobs:
               echo '```'
               echo
             fi
-            if [ -s /tmp/manual-conflicts.txt ]; then
-              echo "### Manual Conflicts"
+            if [ -s /tmp/manual-conflicts-unresolved.txt ]; then
+              echo "### Manual Conflicts (requires resolution)"
               echo
               echo '```'
-              cat /tmp/manual-conflicts.txt
+              cat /tmp/manual-conflicts-unresolved.txt
+              echo '```'
+              echo
+            fi
+            if [ -s /tmp/manual-conflicts-info.txt ]; then
+              echo "### Auto-Resolved Structural Changes (review recommended)"
+              echo
+              echo '```'
+              cat /tmp/manual-conflicts-info.txt
               echo '```'
               echo
             fi

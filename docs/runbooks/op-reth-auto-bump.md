@@ -736,7 +736,8 @@ op-reth-auto-bump-artifacts
 | 文件 | 含义 |
 |------|------|
 | `patch-conflicts.txt` | 包含 merge conflict markers 的文件列表 |
-| `manual-conflicts.txt` | 无法用 conflict markers 表达的结构性冲突 |
+| `manual-conflicts-info.txt` | 已自动处理、但建议 review 的结构性变化 |
+| `manual-conflicts-unresolved.txt` | 需要人工决策的结构性冲突 |
 | `compat-report.md` | Mantle fork dependency report |
 | `pr-body.md` | workflow 生成的 PR body |
 | `worktree.diff` | 剩余 worktree 状态的 binary-safe diff |
@@ -972,16 +973,15 @@ docs/op-reth-auto-bump-conflicts.md
 
 ### 仍有 Manual Structural Conflicts
 
-manual conflicts 包括：
+manual structural conflicts 分两类：
 
-- 上游删除了 Mantle 修改过的文件；
-- 本地删除了上游修改过的文件；
-- 二进制文件两边都发生变化。
+- `manual-conflicts-info.txt`：workflow 已自动处理，但建议 review 的结构性变化，例如上游删除了 Mantle 修改过的文件、本地删除但上游修改后已采用上游版本；
+- `manual-conflicts-unresolved.txt`：需要人工决策的结构性冲突，例如二进制文件两边都发生变化，或 `git merge-file` 运行错误。
 
 处理：
 
-1. 读取 `manual-conflicts.txt` artifact 或 PR conflict report。
-2. 逐文件决定保留本地版本、采用上游版本，还是手动迁移。
+1. 先读取 `manual-conflicts-unresolved.txt` artifact 或 PR conflict report，逐文件决定保留本地版本、采用上游版本，还是手动迁移。
+2. 再读取 `manual-conflicts-info.txt` artifact 或 PR body，确认自动处理的结构性变化没有误删有效 Mantle 逻辑。
 3. 将修复 push 到 `op-reth-auto-bump`。
 4. 重新运行验证。
 
