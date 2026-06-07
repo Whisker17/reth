@@ -1,12 +1,12 @@
 # Mantle op-reth Workspace
 #
 # Structure:
-#   op-reth/       — OP Stack execution layer (from ethereum-optimism/optimism, op-reth/v2.2.1)
+#   op-reth/       — OP Stack execution layer (from ethereum-optimism/optimism, op-reth/v2.2.2)
 #   mantle-reth/   — Mantle trait override layer (custom)
 #   patches/       — Minimal reth core patches (via [patch])
 #
 # Dependency strategy:
-#   reth crates    → paradigmxyz/reth rev 88505c7f (= v2.2.0, same as upstream op-reth pins)
+#   reth crates    → paradigmxyz/reth rev 88505c7f (upstream op-reth/v2.2.2 pin)
 #   revm/op-revm   → mantle-xyz/revm branch mantle-elysium (Mantle fee model patches)
 #   revm-inspectors → mantle-xyz/revm-inspectors branch mantle-elysium
 #   alloy-evm      → mantle-xyz/evm branch mantle-v0.34.0 (Mantle token_ratio trait method)
@@ -29,7 +29,7 @@ categories = ["cryptography", "cryptography::cryptocurrencies"]
 [workspace]
 resolver = "2"
 members = [
-  # Op-Reth (from upstream ethereum-optimism/optimism, op-reth/v2.2.1)
+  # Op-Reth (from upstream ethereum-optimism/optimism, op-reth/v2.2.2)
   "op-reth/bin/",
   "op-reth/crates/chainspec/",
   "op-reth/crates/cli/",
@@ -91,6 +91,15 @@ overflow-checks = false
 debug = "line-tables-only"
 split-debuginfo = "unpacked"
 
+[profile.fast-build]
+inherits = "dev"
+opt-level = 0
+debug = "none"
+split-debuginfo = "off"
+debug-assertions = false
+incremental = true
+codegen-units = 256
+
 [profile.release]
 opt-level = 3
 lto = "thin"
@@ -143,7 +152,7 @@ reth-primitives-traits = { version = "0.3.1", default-features = false }
 reth-rpc-traits = { version = "0.3.1", default-features = false }
 reth-zstd-compressors = { version = "0.3.1", default-features = false }
 
-# ==================== RETH CRATES (git @ v2.2.0, pinned by upstream op-reth) ====================
+# ==================== RETH CRATES (git @ upstream op-reth/v2.2.2 pin) ====================
 reth = { git = "https://github.com/paradigmxyz/reth", rev = "88505c7fcbfdebfd3b56d88c86b62e950043c6c4" }
 reth-basic-payload-builder = { git = "https://github.com/paradigmxyz/reth", rev = "88505c7fcbfdebfd3b56d88c86b62e950043c6c4" }
 reth-chain-state = { git = "https://github.com/paradigmxyz/reth", rev = "88505c7fcbfdebfd3b56d88c86b62e950043c6c4" }
