@@ -257,22 +257,48 @@ jobs:
             git switch -C "$BRANCH_NAME" "origin/${BASE_BRANCH}"
           fi
 
+          OUT_OF_SCOPE_OP_RETH_PATHS=(
+            op-reth/.config
+            op-reth/dprint.json
+            op-reth/examples
+            op-reth/flake.lock
+            op-reth/flake.nix
+            op-reth/funding.json
+            op-reth/tests
+          )
+          stale_out_of_scope_paths=()
+          for path in "${OUT_OF_SCOPE_OP_RETH_PATHS[@]}"; do
+            if [ -e "$path" ] && ! git cat-file -e "${BASE_SHA}:${path}" 2>/dev/null; then
+              stale_out_of_scope_paths+=("$path")
+            fi
+          done
+          if [ "${#stale_out_of_scope_paths[@]}" -gt 0 ]; then
+            git rm -r --ignore-unmatch "${stale_out_of_scope_paths[@]}"
+          fi
+
           rm -rf "$UPSTREAM_WORKTREE" "$OLD_ROOT" "$NEW_ROOT"
           git clone --filter=blob:none --no-checkout "$UPSTREAM_REMOTE" "$UPSTREAM_WORKTREE"
-          git -C "$UPSTREAM_WORKTREE" sparse-checkout set --no-cone 'rust/op-reth/**' 'rust/Cargo.toml'
+          git -C "$UPSTREAM_WORKTREE" sparse-checkout set --no-cone \
+            'rust/op-reth/bin/**' \
+            'rust/op-reth/crates/**' \
+            'rust/Cargo.toml'
 
           git -C "$UPSTREAM_WORKTREE" checkout "$OLD_TAG"
           mkdir -p "$OLD_ROOT"
-          cp -a "$UPSTREAM_WORKTREE/rust/op-reth/." "$OLD_ROOT/"
+          mkdir -p "$OLD_ROOT/bin" "$OLD_ROOT/crates"
+          cp -a "$UPSTREAM_WORKTREE/rust/op-reth/bin/." "$OLD_ROOT/bin/"
+          cp -a "$UPSTREAM_WORKTREE/rust/op-reth/crates/." "$OLD_ROOT/crates/"
 
           git -C "$UPSTREAM_WORKTREE" checkout "$NEW_TAG"
           mkdir -p "$NEW_ROOT"
-          cp -a "$UPSTREAM_WORKTREE/rust/op-reth/." "$NEW_ROOT/"
+          mkdir -p "$NEW_ROOT/bin" "$NEW_ROOT/crates"
+          cp -a "$UPSTREAM_WORKTREE/rust/op-reth/bin/." "$NEW_ROOT/bin/"
+          cp -a "$UPSTREAM_WORKTREE/rust/op-reth/crates/." "$NEW_ROOT/crates/"
           cp "$UPSTREAM_WORKTREE/rust/Cargo.toml" /tmp/upstream-cargo-new.toml
 
           (cd "$OLD_ROOT" && find . -type f | sed 's#^[.]/##' | sort) > /tmp/files-old.txt
           (cd "$NEW_ROOT" && find . -type f | sed 's#^[.]/##' | sort) > /tmp/files-new.txt
-          (cd op-reth && find . -type f | sed 's#^[.]/##' | sort) > /tmp/files-local.txt
+          (cd op-reth && find bin crates -type f | sort) > /tmp/files-local.txt
 
           while IFS= read -r rel; do
             [ -n "$rel" ] || continue
@@ -343,7 +369,7 @@ jobs:
           echo "::notice::Three-way merge complete: ${marker_conflicts} marker conflict(s), ${manual_info_conflicts} auto-resolved conflict(s), ${manual_unresolved_conflicts} unresolved manual conflict(s)"
 
           if [ "$total_blocking_conflicts" -eq 0 ]; then
-            git add op-reth/ .op-reth-base-tag
+            git add op-reth/bin/ op-reth/crates/ .op-reth-base-tag
             commit_staged_if_needed "deps: sync op-reth from ${OLD_TAG} to ${NEW_TAG} (${DATE})" || true
             sync_committed=true
           else
@@ -366,6 +392,10 @@ jobs:
             rev_extraction_failed=true
           fi
 
+          if [ "$rev_extraction_failed" != "true" ]; then
+            sed -i -E "s#op-reth/v[0-9]+[.][0-9]+[.][0-9]+#${NEW_TAG}#g" Cargo.toml
+          fi
+
           if [ "$rev_extraction_failed" != "true" ] && [ "$CURRENT_RETH_REV" != "$UPSTREAM_RETH_REV" ]; then
             sed -i "s/${CURRENT_RETH_REV}/${UPSTREAM_RETH_REV}/g" Cargo.toml
             reth_rev_bumped=true
@@ -378,8 +408,11 @@ jobs:
               lock_update_failed=true
             fi
 
+          fi
+
+          if [ "$rev_extraction_failed" != "true" ] && ! git diff --quiet -- Cargo.toml Cargo.lock; then
             git add Cargo.toml Cargo.lock
-            commit_staged_if_needed "deps: bump reth rev to ${UPSTREAM_RETH_REV:0:7} from ${NEW_TAG} (${DATE})" || true
+            commit_staged_if_needed "deps: align Cargo.toml with ${NEW_TAG} (${DATE})" || true
           fi
 
           {
@@ -392,7 +425,7 @@ jobs:
               "mantle-xyz/revm-inspectors" \
               "mantle-xyz/evm" \
               "mantlenetworkio/mantle-v2"; do
-              refs="$(grep -RIn "$repo" Cargo.toml op-reth/ mantle-reth/ patches/ 2>/dev/null | sed 's/|/\\|/g' || true)"
+              refs="$(grep -RIn "$repo" Cargo.toml op-reth/bin/ op-reth/crates/ mantle-reth/ patches/ 2>/dev/null | sed 's/|/\\|/g' || true)"
               if [ -z "$refs" ]; then
                 refs="_not found_"
               else
@@ -411,7 +444,7 @@ jobs:
               break
             fi
 
-            remaining_markers="$(grep -IRl '<<<<<<<' op-reth/ mantle-reth/ patches/ Cargo.toml Cargo.lock 2>/dev/null || true)"
+            remaining_markers="$(grep -IRl '<<<<<<<' op-reth/bin/ op-reth/crates/ mantle-reth/ patches/ Cargo.toml Cargo.lock 2>/dev/null || true)"
             if [ -n "$remaining_markers" ]; then
               has_unresolved_conflicts=true
               if ! command -v claude >/dev/null 2>&1; then
@@ -426,7 +459,7 @@ jobs:
           ${remaining_markers}
 
           Rules:
-          - Only edit op-reth/, mantle-reth/, patches/, Cargo.toml, and Cargo.lock if required.
+          - Only edit op-reth/bin/, op-reth/crates/, mantle-reth/, patches/, Cargo.toml, and Cargo.lock if required.
           - Do not change git URLs, revs, or branch references unless a conflict marker requires it.
           - Preserve Mantle-specific behavior.
           - Remove every conflict marker.
@@ -462,7 +495,7 @@ jobs:
             set -e
 
             fix_prompt="$(cat <<PROMPT_EOF
-          This Rust workspace synced op-reth/ from upstream ${OLD_TAG} to ${NEW_TAG}.
+          This Rust workspace synced op-reth/bin/ and op-reth/crates/ from upstream ${OLD_TAG} to ${NEW_TAG}.
           The paradigmxyz/reth rev was ${CURRENT_RETH_REV:-unknown} -> ${UPSTREAM_RETH_REV:-unknown}.
 
           cargo check is failing:
@@ -472,7 +505,7 @@ jobs:
           Please fix compilation errors.
 
           Rules:
-          - Fix files in op-reth/ and mantle-reth/ first.
+          - Fix files in op-reth/bin/, op-reth/crates/, and mantle-reth/ first.
           - reth core crates come from paradigmxyz/reth git deps; do not modify their source.
           - Do not modify Cargo.toml git URLs, revs, or branch references.
           - Do not suppress warnings with allow attributes.
@@ -487,7 +520,7 @@ jobs:
             set -e
           done
 
-          remaining_markers="$(grep -IRl '<<<<<<<' op-reth/ mantle-reth/ patches/ Cargo.toml Cargo.lock 2>/dev/null || true)"
+          remaining_markers="$(grep -IRl '<<<<<<<' op-reth/bin/ op-reth/crates/ mantle-reth/ patches/ Cargo.toml Cargo.lock 2>/dev/null || true)"
           if [ -n "$remaining_markers" ]; then
             has_unresolved_conflicts=true
           else
@@ -507,22 +540,24 @@ jobs:
             if [ "$has_unresolved_conflicts" = "true" ] || [ "$has_unresolved_manual_conflicts" = "true" ]; then
               validation_status="failed"
               write_conflict_report
-              git add op-reth/ mantle-reth/ patches/ .op-reth-base-tag "$CONFLICT_REPORT"
+              git add op-reth/bin/ op-reth/crates/ mantle-reth/ patches/ .op-reth-base-tag Cargo.toml Cargo.lock "$CONFLICT_REPORT"
               commit_staged_if_needed "wip: unresolved op-reth sync conflicts from ${OLD_TAG} to ${NEW_TAG} (${DATE})" || true
               sync_committed="wip"
             else
-              git add op-reth/ .op-reth-base-tag
+              git add op-reth/bin/ op-reth/crates/ mantle-reth/ patches/ .op-reth-base-tag Cargo.toml Cargo.lock
               commit_staged_if_needed "deps: sync op-reth from ${OLD_TAG} to ${NEW_TAG} (${DATE})" || true
               sync_committed=true
             fi
-          elif [ -n "$(git diff --name-only op-reth/ mantle-reth/ patches/)" ]; then
+          elif [ -n "$(git status --porcelain -- op-reth/ mantle-reth/ patches/ Cargo.toml Cargo.lock)" ]; then
             if [ "$has_unresolved_conflicts" = "true" ] || [ "$has_unresolved_manual_conflicts" = "true" ]; then
               validation_status="failed"
               write_conflict_report
-              git add op-reth/ mantle-reth/ patches/ "$CONFLICT_REPORT"
+              git add -u op-reth/ mantle-reth/ patches/ Cargo.toml Cargo.lock
+              git add op-reth/bin/ op-reth/crates/ mantle-reth/ patches/ Cargo.toml Cargo.lock "$CONFLICT_REPORT"
               commit_staged_if_needed "wip: unresolved op-reth follow-up fixes (${DATE})" || true
             else
-              git add op-reth/ mantle-reth/ patches/
+              git add -u op-reth/ mantle-reth/ patches/ Cargo.toml Cargo.lock
+              git add op-reth/bin/ op-reth/crates/ mantle-reth/ patches/ Cargo.toml Cargo.lock
               commit_staged_if_needed "fix: resolve breaking changes from op-reth sync (${DATE})" || true
             fi
           fi
@@ -643,7 +678,7 @@ jobs:
           {
             echo "## Automated op-reth Sync"
             echo
-            echo "Synced \`op-reth/\` from upstream \`${OLD_TAG}\` to \`${NEW_TAG}\`."
+            echo "Synced \`op-reth/bin/\` and \`op-reth/crates/\` from upstream \`${OLD_TAG}\` to \`${NEW_TAG}\`."
             echo
             echo "**Base branch:** \`${BASE_BRANCH}\` at \`${BASE_SHA:0:7}\`"
             echo
