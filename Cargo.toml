@@ -1,7 +1,7 @@
 # Mantle op-reth Workspace
 #
 # Structure:
-#   op-reth/       — OP Stack execution layer (from ethereum-optimism/optimism, op-reth/v2.2.1)
+#   op-reth/       — OP Stack execution layer (from ethereum-optimism/optimism, op-reth/v2.2.2)
 #   mantle-reth/   — Mantle trait override layer (custom)
 #   patches/       — Minimal reth core patches (via [patch])
 #
@@ -29,7 +29,7 @@ categories = ["cryptography", "cryptography::cryptocurrencies"]
 [workspace]
 resolver = "2"
 members = [
-  # Op-Reth (from upstream ethereum-optimism/optimism, op-reth/v2.2.1)
+  # Op-Reth (from upstream ethereum-optimism/optimism, op-reth/v2.2.2)
   "op-reth/bin/",
   "op-reth/crates/chainspec/",
   "op-reth/crates/cli/",
