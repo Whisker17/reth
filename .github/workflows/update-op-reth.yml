@@ -280,6 +280,11 @@ jobs:
             NEW="$NEW_ROOT/$rel"
             LOCAL="op-reth/$rel"
 
+            if [ ! -e "$OLD" ] && [ ! -e "$NEW" ]; then
+              # Local-only fork file; preserve it when syncing upstream.
+              continue
+            fi
+
             if [ ! -e "$OLD" ] && [ -e "$NEW" ]; then
               mkdir -p "$(dirname "$LOCAL")"
               cp -a "$NEW" "$LOCAL"
@@ -758,3 +763,4 @@ jobs:
           name: op-reth-auto-bump-artifacts
           path: .op-reth-auto-bump-artifacts/**
           if-no-files-found: ignore
+          include-hidden-files: true
