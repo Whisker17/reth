@@ -103,6 +103,7 @@ jobs:
           has_unresolved_conflicts=false
           has_unresolved_manual_conflicts=false
           has_manual_info=false
+          workspace_deps_synced=false
           current_reth_rev=""
           upstream_reth_rev=""
           failure_summary=""
@@ -171,6 +172,131 @@ jobs:
 
           is_binary() {
             LC_ALL=C head -c 8000 "$1" | grep -qP '\x00'
+          }
+
+          should_take_upstream_binary() {
+            case "$1" in
+              op-reth/crates/chainspec/res/superchain-configs.tar)
+                return 0
+                ;;
+              *)
+                return 1
+                ;;
+            esac
+          }
+
+          sync_missing_workspace_dependencies() {
+            local upstream_manifest="$1"
+            local root_manifest="$2"
+            local referenced="/tmp/op-reth-tempo-workspace-deps-referenced.txt"
+            local existing="/tmp/op-reth-tempo-workspace-deps-existing.txt"
+            local missing="/tmp/op-reth-tempo-workspace-deps-missing.txt"
+            local defs="/tmp/op-reth-tempo-workspace-deps-defs.txt"
+            local added="/tmp/op-reth-tempo-workspace-deps-added.txt"
+            local updated="/tmp/op-reth-tempo-Cargo.toml"
+
+            find op-reth/bin op-reth/crates -name Cargo.toml -exec awk '
+              function dep_key(line, key) {
+                key = line
+                sub(/^[[:space:]]*/, "", key)
+                if (key ~ /^[^=]+[.]workspace[[:space:]]*=/) {
+                  sub(/[.]workspace[[:space:]]*=.*/, "", key)
+                } else {
+                  sub(/[[:space:]]*=.*/, "", key)
+                }
+                gsub(/^[[:space:]]+|[[:space:]]+$/, "", key)
+                gsub(/^"|"$/, "", key)
+                return key
+              }
+              /^[[:space:]]*"?[A-Za-z0-9_.-]+"?([.]workspace)?[[:space:]]*=/ && /workspace[[:space:]]*=[[:space:]]*true/ {
+                print dep_key($0)
+              }
+            ' {} + | sort -u > "$referenced"
+
+            awk '
+              function dep_key(line, key) {
+                key = line
+                sub(/^[[:space:]]*/, "", key)
+                sub(/[[:space:]]*=.*/, "", key)
+                gsub(/^[[:space:]]+|[[:space:]]+$/, "", key)
+                gsub(/^"|"$/, "", key)
+                return key
+              }
+              /^\[workspace[.]dependencies\]/ { in_ws = 1; next }
+              in_ws && /^\[/ { exit }
+              in_ws && /^[[:space:]]*"?[A-Za-z0-9_.-]+"?[[:space:]]*=/ {
+                print dep_key($0)
+              }
+            ' "$root_manifest" | sort -u > "$existing"
+
+            comm -23 "$referenced" "$existing" > "$missing"
+            : > "$defs"
+            : > "$added"
+
+            while IFS= read -r dep; do
+              [ -n "$dep" ] || continue
+              dep_line="$(awk -v dep="$dep" '
+                function dep_key(line, key) {
+                  key = line
+                  sub(/^[[:space:]]*/, "", key)
+                  sub(/[[:space:]]*=.*/, "", key)
+                  gsub(/^[[:space:]]+|[[:space:]]+$/, "", key)
+                  gsub(/^"|"$/, "", key)
+                  return key
+                }
+                /^\[workspace[.]dependencies\]/ { in_ws = 1; next }
+                in_ws && /^\[/ { exit }
+                in_ws && /^[[:space:]]*"?[A-Za-z0-9_.-]+"?[[:space:]]*=/ {
+                  if (dep_key($0) == dep) {
+                    print $0
+                    exit
+                  }
+                }
+              ' "$upstream_manifest")"
+
+              if [ -n "$dep_line" ]; then
+                echo "$dep_line" >> "$defs"
+                echo "$dep" >> "$added"
+              else
+                echo "::warning::op-reth references workspace dependency '${dep}', but upstream root Cargo.toml has no matching definition"
+              fi
+            done < "$missing"
+
+            if [ ! -s "$defs" ]; then
+              return 0
+            fi
+
+            awk -v defs_file="$defs" '
+              BEGIN {
+                while ((getline line < defs_file) > 0) {
+                  defs = defs line "\n"
+                }
+              }
+              /^\[workspace[.]dependencies\]/ {
+                in_ws = 1
+                print
+                next
+              }
+              in_ws && /^\[/ && ! inserted {
+                print ""
+                print "# Added from upstream op-reth workspace dependencies during auto sync."
+                printf "%s", defs
+                inserted = 1
+                in_ws = 0
+              }
+              { print }
+              END {
+                if (in_ws && ! inserted) {
+                  print ""
+                  print "# Added from upstream op-reth workspace dependencies during auto sync."
+                  printf "%s", defs
+                }
+              }
+            ' "$root_manifest" > "$updated"
+            mv "$updated" "$root_manifest"
+
+            workspace_deps_synced=true
+            echo "workspace-deps: added $(tr '\n' ' ' < "$added" | sed 's/[[:space:]]*$//')" >> /tmp/op-reth-tempo-claude-summary.txt
           }
 
           stage_scoped_changes() {
@@ -498,6 +624,12 @@ jobs:
               continue
             fi
 
+            if should_take_upstream_binary "$LOCAL"; then
+              cp -a "$NEW" "$LOCAL"
+              echo "$LOCAL (known upstream binary resource; took upstream)" >> /tmp/op-reth-tempo-manual-conflicts-info.txt
+              continue
+            fi
+
             if is_binary "$OLD" || is_binary "$NEW" || is_binary "$LOCAL"; then
               if diff -q "$LOCAL" "$OLD" >/dev/null 2>&1; then
                 cp -a "$NEW" "$LOCAL"
@@ -539,11 +671,15 @@ jobs:
             rev_extraction_failed=true
           fi
 
+          sync_missing_workspace_dependencies /tmp/op-reth-tempo-upstream-Cargo.toml Cargo.toml
+
           sed -i -E "s#op-reth/v[0-9]+[.][0-9]+[.][0-9]+#${NEW_TAG}#g" Cargo.toml
           if [ "$rev_extraction_failed" != "true" ] && [ "$current_reth_rev" != "$upstream_reth_rev" ]; then
             sed -i "s/${current_reth_rev}/${upstream_reth_rev}/g" Cargo.toml
             reth_rev_bumped=true
+          fi
 
+          if [ "$reth_rev_bumped" = "true" ] || [ "$workspace_deps_synced" = "true" ]; then
             set +e
             cargo update
             cargo_update_exit=$?
