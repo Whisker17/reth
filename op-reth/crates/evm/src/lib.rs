@@ -68,7 +68,7 @@ pub use tx::OpTx;
 
 pub use alloy_op_evm::{
     OpBlockExecutionCtx, OpBlockExecutorFactory, OpEvm, OpEvmFactory, PostExecMode,
-    post_exec::{PostExecExecutorExt, WarmingRefundEvent, WarmingRefundKind, WarmingState},
+    post_exec::PostExecExecutorExt,
 };
 
 mod post_exec_ext;
@@ -438,7 +438,7 @@ mod tests {
                 .chain(10.into())
                 .genesis(Genesis::default())
                 .with_fork(
-                    reth_optimism_forks::OpHardfork::Lagoon,
+                    reth_optimism_forks::OpHardfork::Interop,
                     reth_chainspec::ForkCondition::Timestamp(activation),
                 )
                 .build(),
