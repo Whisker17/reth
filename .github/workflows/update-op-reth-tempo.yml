@@ -527,15 +527,11 @@ jobs:
             git switch -C "$BRANCH_NAME" "$BASE_REF"
           fi
 
-          current_tag="$(extract_op_reth_tag_from_file Cargo.toml || true)"
-          if [ -z "$current_tag" ]; then
-            current_tag="$base_tag"
-          fi
-          if [[ ! "${current_tag:-}" =~ ^op-reth/v[0-9]+[.][0-9]+[.][0-9]+$ ]]; then
+          if [[ ! "${base_tag:-}" =~ ^op-reth/v[0-9]+[.][0-9]+[.][0-9]+$ ]]; then
             echo "::error::Could not determine current op-reth tag from Cargo.toml or base branch state"
             exit 1
           fi
-          OLD_TAG="$current_tag"
+          OLD_TAG="$base_tag"
 
           if [ "$OLD_TAG" = "$NEW_TAG" ]; then
             echo "::notice::Already up to date: ${OLD_TAG}"
