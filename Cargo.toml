@@ -400,6 +400,10 @@ url = "2.5"
 
 # ==================== [patch] — reth core minimal patches ====================
 # Uncomment when patches/ crates are populated:
+
+# Added from upstream op-reth workspace dependencies during auto sync.
+page_size = "0.6.0"
+reth-optimism-post-exec-replay = { path = "op-reth/crates/post-exec-replay/" }
 [patch."https://github.com/paradigmxyz/reth"]
 reth-trie-common = { path = "patches/reth-trie-common" }
 # reth-rpc = { path = "patches/reth-rpc" }
