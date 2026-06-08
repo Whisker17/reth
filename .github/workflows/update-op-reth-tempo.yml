@@ -675,16 +675,6 @@ jobs:
             reth_rev_bumped=true
           fi
 
-          if [ "$reth_rev_bumped" = "true" ] || [ "$workspace_deps_synced" = "true" ]; then
-            set +e
-            cargo update
-            cargo_update_exit=$?
-            set -e
-            if [ "$cargo_update_exit" -ne 0 ]; then
-              lock_update_failed=true
-            fi
-          fi
-
           {
             echo "### Mantle Fork Dependency Report"
             echo
@@ -716,6 +706,16 @@ jobs:
             write_conflict_report
           else
             has_unresolved_conflicts=false
+          fi
+
+          if [ "$has_unresolved_conflicts" != "true" ] && { [ "$reth_rev_bumped" = "true" ] || [ "$workspace_deps_synced" = "true" ]; }; then
+            set +e
+            cargo update
+            cargo_update_exit=$?
+            set -e
+            if [ "$cargo_update_exit" -ne 0 ]; then
+              lock_update_failed=true
+            fi
           fi
 
           stage_scoped_changes
