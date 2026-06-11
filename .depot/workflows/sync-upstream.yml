@@ -1,0 +1,881 @@
+# Depot CI Migration
+# Source: .github/workflows/sync-upstream.yml
+#
+# No changes were necessary.
+
+name: Sync upstream op-reth
+on:
+  workflow_dispatch:
+    inputs:
+      base_branch:
+        description: Base branch to sync onto
+        required: true
+        default: mantle-elysium
+        type: string
+      target_tag:
+        description: Upstream op-reth tag to sync, e.g. op-reth/v2.2.3
+        required: true
+        type: string
+      dry_run:
+        description: Run sync and validation without pushing or creating/updating PR
+        required: false
+        default: true
+        type: boolean
+concurrency:
+  group: sync-upstream-${{ inputs.base_branch }}
+  cancel-in-progress: false
+permissions:
+  contents: write
+  pull-requests: write
+  issues: write
+jobs:
+  update-op-reth:
+    name: Sync upstream op-reth
+    runs-on: ${{ vars.OP_RETH_AUTO_BUMP_RUNNER || 'ubuntu-latest' }}
+    timeout-minutes: 120
+    env:
+      BASE_BRANCH: ${{ inputs.base_branch }}
+      TARGET_TAG: ${{ inputs.target_tag }}
+      DRY_RUN: ${{ inputs.dry_run }}
+      GH_TOKEN: ${{ secrets.BOT_GITHUB_TOKEN }}
+      ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+      ANTHROPIC_BASE_URL: ${{ secrets.ANTHROPIC_BASE_URL }}
+      LARK_WEBHOOK_URL: ${{ secrets.LARK_WEBHOOK_URL }}
+      BRANCH_NAME: op-reth-auto-bump
+      ARTIFACT_DIR: .op-reth-sync-artifacts
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.BOT_GITHUB_TOKEN }}
+          fetch-depth: 0
+      - name: Show Rust toolchain
+        run: rustup show
+      - name: Cache cargo sources
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: ${{ runner.os }}-cargo-sources-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-sources-
+      - name: Setup Node for Claude Code
+        if: ${{ env.ANTHROPIC_API_KEY != '' }}
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Install Claude Code
+        if: ${{ env.ANTHROPIC_API_KEY != '' }}
+        run: npm install -g @anthropic-ai/claude-code
+      - name: Sync op-reth and create PR
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+
+          DATE="$(date -u +%Y-%m-%d)"
+          MAX_CHECK_ATTEMPTS=6
+          MAX_TEST_ATTEMPTS=4
+          AI_DEADLINE_SECONDS=$((SECONDS + 2700))
+          UPSTREAM_REMOTE="https://github.com/ethereum-optimism/optimism.git"
+          UPSTREAM_WORKTREE="/tmp/optimism-op-reth-sync"
+          OLD_ROOT="/tmp/op-reth-sync-old"
+          NEW_ROOT="/tmp/op-reth-sync-new"
+          CONFLICT_REPORT="docs/op-reth-auto-bump-conflicts.md"
+
+          mkdir -p "$ARTIFACT_DIR"
+          rm -f "$CONFLICT_REPORT"
+          : > /tmp/op-reth-sync-patch-conflicts.txt
+          : > /tmp/op-reth-sync-manual-conflicts-info.txt
+          : > /tmp/op-reth-sync-manual-conflicts-unresolved.txt
+          : > /tmp/op-reth-sync-compat-report.txt
+          : > /tmp/op-reth-sync-claude-summary.txt
+
+          validation_status="failed"
+          reth_rev_bumped=false
+          rev_extraction_failed=false
+          lock_update_failed=false
+          has_unresolved_conflicts=false
+          has_unresolved_manual_conflicts=false
+          has_manual_info=false
+          current_reth_rev=""
+          upstream_reth_rev=""
+          failure_summary=""
+
+          git config user.name "mantle-op-reth-auto-bump"
+          git config user.email "actions@github.com"
+          git fetch origin "$BASE_BRANCH"
+          BASE_REF="origin/${BASE_BRANCH}"
+          BASE_SHA="$(git rev-parse "$BASE_REF")"
+          workflow_completed=false
+
+          send_lark() {
+            local title="$1"
+            local content="$2"
+
+            if [ -z "${LARK_WEBHOOK_URL:-}" ]; then
+              echo "::warning::LARK_WEBHOOK_URL is not set; skipping notification"
+              return 0
+            fi
+
+            jq -n \
+              --arg title "$title" \
+              --arg content "$content" \
+              '{
+                msg_type: "interactive",
+                card: {
+                  config: {wide_screen_mode: true},
+                  header: {title: {tag: "plain_text", content: $title}},
+                  elements: [{tag: "div", text: {tag: "lark_md", content: $content}}]
+                }
+              }' > /tmp/op-reth-sync-lark-payload.json
+
+            curl -sf -X POST "$LARK_WEBHOOK_URL" \
+              -H "Content-Type: application/json" \
+              -d @/tmp/op-reth-sync-lark-payload.json || echo "::warning::Lark notification failed"
+          }
+
+          notify_failure() {
+            local exit_code=$?
+            if [ "$exit_code" -ne 0 ] && [ "$workflow_completed" != "true" ]; then
+              send_lark \
+                "op-reth sync failed" \
+                "Workflow run ${GITHUB_RUN_NUMBER:-local} failed for ${BASE_BRANCH} -> ${TARGET_TAG}. Inspect ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}."
+            fi
+          }
+          trap notify_failure EXIT
+
+          commit_staged_if_needed() {
+            local message="$1"
+            if git diff --cached --quiet; then
+              git reset -q
+              return 1
+            fi
+            git commit -m "$message"
+          }
+
+          extract_op_reth_tag_from_file() {
+            local file="$1"
+            awk 'match($0, /op-reth\/v[0-9]+\.[0-9]+\.[0-9]+/) { print substr($0, RSTART, RLENGTH); exit }' "$file"
+          }
+
+          extract_reth_rev_from_file() {
+            local file="$1"
+            sed -nE '/paradigmxyz\/reth/ s/.*rev = "([0-9a-f]{40})".*/\1/p' "$file" | head -n 1
+          }
+
+          is_binary() {
+            LC_ALL=C head -c 8000 "$1" | grep -qP '\x00'
+          }
+
+          stage_scoped_changes() {
+            git reset -q -- .op-reth-base-tag 2>/dev/null || true
+            git add -u op-reth/bin/ op-reth/crates/ Cargo.toml Cargo.lock 2>/dev/null || true
+            git add op-reth/bin/ op-reth/crates/ Cargo.toml Cargo.lock 2>/dev/null || true
+            if [ -d mantle-reth ]; then
+              git add -u mantle-reth/ 2>/dev/null || true
+              git add mantle-reth/ 2>/dev/null || true
+            fi
+            if [ -d patches ]; then
+              git add -u patches/ 2>/dev/null || true
+              git add patches/ 2>/dev/null || true
+            fi
+            if [ -f "$CONFLICT_REPORT" ]; then
+              git add "$CONFLICT_REPORT"
+            fi
+          }
+
+          write_conflict_report() {
+            mkdir -p docs
+            {
+              echo "# op-reth Auto Bump Conflicts"
+              echo
+              echo "Generated by workflow run ${GITHUB_RUN_NUMBER:-local} on ${DATE}."
+              echo
+              echo "- Base branch: \`${BASE_BRANCH}\` at \`${BASE_SHA:0:7}\`"
+              echo "- Upstream range: \`${OLD_TAG}\` -> \`${NEW_TAG}\`"
+              echo "- Validation status: \`${validation_status}\`"
+              echo
+              if [ -s /tmp/op-reth-sync-patch-conflicts.txt ]; then
+                echo "## Marker Conflicts"
+                echo
+                echo '```'
+                cat /tmp/op-reth-sync-patch-conflicts.txt
+                echo '```'
+                echo
+              fi
+              if [ -s /tmp/op-reth-sync-manual-conflicts-unresolved.txt ]; then
+                echo "## Manual Conflicts"
+                echo
+                echo '```'
+                cat /tmp/op-reth-sync-manual-conflicts-unresolved.txt
+                echo '```'
+                echo
+              fi
+              if [ -s /tmp/op-reth-sync-manual-conflicts-info.txt ]; then
+                echo "## Auto-Resolved Structural Changes"
+                echo
+                echo '```'
+                cat /tmp/op-reth-sync-manual-conflicts-info.txt
+                echo '```'
+                echo
+              fi
+              echo "Resolve the blocking conflicts above, review any auto-resolved structural changes, and remove this report before marking the PR ready."
+            } > "$CONFLICT_REPORT"
+          }
+
+          build_artifacts() {
+            cp /tmp/op-reth-sync-patch-conflicts.txt "$ARTIFACT_DIR/patch-conflicts.txt" 2>/dev/null || true
+            cp /tmp/op-reth-sync-manual-conflicts-info.txt "$ARTIFACT_DIR/manual-conflicts-info.txt" 2>/dev/null || true
+            cp /tmp/op-reth-sync-manual-conflicts-unresolved.txt "$ARTIFACT_DIR/manual-conflicts-unresolved.txt" 2>/dev/null || true
+            cp /tmp/op-reth-sync-compat-report.txt "$ARTIFACT_DIR/compat-report.md" 2>/dev/null || true
+            cp /tmp/op-reth-sync-claude-summary.txt "$ARTIFACT_DIR/claude-summary.txt" 2>/dev/null || true
+            cp /tmp/op-reth-sync-pr-body.txt "$ARTIFACT_DIR/pr-body.md" 2>/dev/null || true
+            cp /tmp/op-reth-sync-final-cargo-check.log "$ARTIFACT_DIR/final-cargo-check.log" 2>/dev/null || true
+            cp /tmp/op-reth-sync-final-test-build.log "$ARTIFACT_DIR/final-test-build.log" 2>/dev/null || true
+            git diff --binary > "$ARTIFACT_DIR/worktree.diff" || true
+          }
+
+          run_cargo_command() {
+            local log_file="$1"
+            shift
+            set +e
+            "$@" 2>&1 | tee "$log_file"
+            local exit_code=${PIPESTATUS[0]}
+            set -e
+            return "$exit_code"
+          }
+
+          resolve_conflict_markers_with_claude() {
+            local phase="$1"
+            local remaining_markers
+            remaining_markers="$(grep -IRl '<<<<<<<' op-reth/bin/ op-reth/crates/ mantle-reth/ patches/ Cargo.toml Cargo.lock 2>/dev/null || true)"
+            if [ -z "$remaining_markers" ]; then
+              return 0
+            fi
+
+            has_unresolved_conflicts=true
+            if ! command -v claude >/dev/null 2>&1; then
+              echo "::warning::claude CLI not available; leaving conflict markers for manual review"
+              return 1
+            fi
+
+            local conflict_prompt
+            printf -v conflict_prompt '%s\n' \
+              "Resolve merge conflict markers left by a scoped op-reth sync." \
+              "" \
+              "Context:" \
+              "- This workflow performs the mechanical bump, runs Cargo, uses Claude only for compatibility fixes, then creates or updates one fixed PR branch." \
+              "- Upstream repository: ethereum-optimism/optimism" \
+              "- Upstream range: ${OLD_TAG} -> ${NEW_TAG}" \
+              "- Synced paths only: op-reth/bin/ and op-reth/crates/" \
+              "- Reth core rev: ${current_reth_rev:-unknown} -> ${upstream_reth_rev:-unknown}" \
+              "- Phase: ${phase}" \
+              "" \
+              "Files with markers:" \
+              "${remaining_markers}" \
+              "" \
+              "Rules:" \
+              "- Remove every conflict marker." \
+              "- Prefer preserving Mantle-specific behavior when resolving local fork changes." \
+              "- Only edit op-reth/bin/, op-reth/crates/, mantle-reth/, patches/, Cargo.toml, and Cargo.lock if required." \
+              "- Do not add op-reth/examples, op-reth/tests, or other upstream-only directories." \
+              "- Do not change the target op-reth tag or the paradigmxyz/reth git rev selected by the workflow."
+
+            set +e
+            claude -p "$conflict_prompt" \
+              --allowedTools "Bash(cargo *)" "Bash(git diff *)" "Bash(git status *)" "Bash(rg *)" "Bash(grep *)" "Bash(find *)" "Read" "Edit" "MultiEdit" \
+              --max-turns 30
+            local claude_exit=$?
+            set -e
+
+            echo "${phase}: conflict-marker Claude exit ${claude_exit}" >> /tmp/op-reth-sync-claude-summary.txt
+            [ "$claude_exit" -eq 0 ]
+          }
+
+          run_claude_fix_loop() {
+            local phase="$1"
+            local max_attempts="$2"
+            shift 2
+            local cmd_display="$*"
+            local log_file="/tmp/op-reth-sync-${phase// /-}.log"
+
+            for attempt in $(seq 1 "$max_attempts"); do
+              if [ "$SECONDS" -gt "$AI_DEADLINE_SECONDS" ]; then
+                echo "::warning::AI fix deadline reached during ${phase}"
+                return 1
+              fi
+
+              if run_cargo_command "$log_file" "$@"; then
+                echo "${phase}: passed on attempt ${attempt}" >> /tmp/op-reth-sync-claude-summary.txt
+                return 0
+              fi
+
+              if ! command -v claude >/dev/null 2>&1; then
+                echo "::warning::claude CLI not available; skipping AI fix for ${phase}"
+                return 1
+              fi
+
+              local cargo_output
+              cargo_output="$(tail -220 "$log_file")"
+
+              local fix_prompt
+              printf -v fix_prompt '%s\n' \
+                "The Rust workspace was updated using an automated op-reth sync workflow." \
+                "" \
+                "Context:" \
+                "- Upstream repository: ethereum-optimism/optimism" \
+                "- Upstream range: ${OLD_TAG} -> ${NEW_TAG}" \
+                "- Synced paths only: op-reth/bin/ and op-reth/crates/" \
+                "- Reth core rev: ${current_reth_rev:-unknown} -> ${upstream_reth_rev:-unknown}" \
+                "- Command failing: ${cmd_display}" \
+                "- Attempt: ${attempt}/${max_attempts}" \
+                "" \
+                "Failure output:" \
+                "" \
+                "${cargo_output}" \
+                "" \
+                "Please fix the build or test-build failure." \
+                "" \
+                "Rules:" \
+                "- Prefer API migration and compatibility fixes over broad refactors." \
+                "- Fix op-reth/bin/, op-reth/crates/, mantle-reth/, patches/, Cargo.toml, or Cargo.lock only when needed." \
+                "- Preserve Mantle-specific behavior." \
+                "- Do not modify reth core source from git dependencies." \
+                "- Do not change the op-reth target tag, the paradigmxyz/reth git URL, or the workflow-selected reth rev." \
+                "- Do not add op-reth/examples, op-reth/tests, or other upstream-only directories." \
+                "- Do not hide errors with allow attributes or by deleting tests."
+
+              set +e
+              claude -p "$fix_prompt" \
+                --allowedTools "Bash(cargo *)" "Bash(git diff *)" "Bash(git status *)" "Bash(rg *)" "Bash(grep *)" "Bash(find *)" "Read" "Edit" "MultiEdit" \
+                --max-turns 30
+              local claude_exit=$?
+              set -e
+
+              echo "${phase}: Claude exit ${claude_exit} on attempt ${attempt}" >> /tmp/op-reth-sync-claude-summary.txt
+            done
+
+            return 1
+          }
+
+          if [[ ! "${TARGET_TAG}" =~ ^op-reth/v[0-9]+[.][0-9]+[.][0-9]+$ ]]; then
+            echo "::error::Invalid target tag: ${TARGET_TAG}"
+            exit 1
+          fi
+          NEW_TAG="$TARGET_TAG"
+
+          if ! git ls-remote --exit-code --tags "$UPSTREAM_REMOTE" "refs/tags/${NEW_TAG}" >/dev/null 2>&1; then
+            echo "::error::Target tag does not exist upstream: ${NEW_TAG}"
+            exit 1
+          fi
+
+          base_tag=""
+          if git show "${BASE_REF}:Cargo.toml" > /tmp/op-reth-sync-base-Cargo.toml 2>/dev/null; then
+            base_tag="$(extract_op_reth_tag_from_file /tmp/op-reth-sync-base-Cargo.toml || true)"
+          fi
+          if [ -z "$base_tag" ] && git cat-file -e "${BASE_REF}:.op-reth-base-tag" 2>/dev/null; then
+            base_tag="$(git show "${BASE_REF}:.op-reth-base-tag" | tr -d '[:space:]')"
+          fi
+
+          if [ "$DRY_RUN" = "true" ]; then
+            git switch -C "$BRANCH_NAME" "$BASE_REF"
+          elif git ls-remote --exit-code --heads origin "$BRANCH_NAME" >/dev/null 2>&1; then
+            git fetch origin "$BRANCH_NAME"
+            git switch -C "$BRANCH_NAME" "origin/${BRANCH_NAME}"
+            set +e
+            git rebase "$BASE_REF"
+            rebase_exit=$?
+            set -e
+            if [ "$rebase_exit" -ne 0 ]; then
+              echo "::warning::Rebase failed; restarting ${BRANCH_NAME} from ${BASE_BRANCH}"
+              git rebase --abort || true
+              git switch -C "$BRANCH_NAME" "$BASE_REF"
+            fi
+          else
+            git switch -C "$BRANCH_NAME" "$BASE_REF"
+          fi
+
+          current_tag="$(extract_op_reth_tag_from_file Cargo.toml || true)"
+          if [ -z "$current_tag" ]; then
+            current_tag="$base_tag"
+          fi
+          if [[ ! "${current_tag:-}" =~ ^op-reth/v[0-9]+[.][0-9]+[.][0-9]+$ ]]; then
+            echo "::error::Could not determine current op-reth tag from Cargo.toml or base branch state"
+            exit 1
+          fi
+          OLD_TAG="$current_tag"
+
+          if [ "$OLD_TAG" = "$NEW_TAG" ]; then
+            echo "::notice::Already up to date: ${OLD_TAG}"
+            send_lark "op-reth sync: no update" "Current tag ${OLD_TAG}; no PR needed for ${BASE_BRANCH}."
+            workflow_completed=true
+            exit 0
+          fi
+
+          OUT_OF_SCOPE_OP_RETH_PATHS=(
+            op-reth/.config
+            op-reth/dprint.json
+            op-reth/examples
+            op-reth/flake.lock
+            op-reth/flake.nix
+            op-reth/funding.json
+            op-reth/tests
+          )
+          stale_out_of_scope_paths=()
+          for path in "${OUT_OF_SCOPE_OP_RETH_PATHS[@]}"; do
+            if [ -e "$path" ] && ! git cat-file -e "${BASE_SHA}:${path}" 2>/dev/null; then
+              stale_out_of_scope_paths+=("$path")
+            fi
+          done
+          if [ "${#stale_out_of_scope_paths[@]}" -gt 0 ]; then
+            git rm -r --ignore-unmatch "${stale_out_of_scope_paths[@]}"
+            rm -rf "${stale_out_of_scope_paths[@]}"
+          fi
+
+          rm -rf "$UPSTREAM_WORKTREE" "$OLD_ROOT" "$NEW_ROOT"
+          git clone --filter=blob:none --no-checkout "$UPSTREAM_REMOTE" "$UPSTREAM_WORKTREE"
+          git -C "$UPSTREAM_WORKTREE" sparse-checkout set --no-cone \
+            'rust/op-reth/bin/**' \
+            'rust/op-reth/crates/**' \
+            'rust/Cargo.toml'
+
+          git -C "$UPSTREAM_WORKTREE" checkout "$OLD_TAG"
+          mkdir -p "$OLD_ROOT/bin" "$OLD_ROOT/crates"
+          cp -a "$UPSTREAM_WORKTREE/rust/op-reth/bin/." "$OLD_ROOT/bin/"
+          cp -a "$UPSTREAM_WORKTREE/rust/op-reth/crates/." "$OLD_ROOT/crates/"
+
+          git -C "$UPSTREAM_WORKTREE" checkout "$NEW_TAG"
+          mkdir -p "$NEW_ROOT/bin" "$NEW_ROOT/crates"
+          cp -a "$UPSTREAM_WORKTREE/rust/op-reth/bin/." "$NEW_ROOT/bin/"
+          cp -a "$UPSTREAM_WORKTREE/rust/op-reth/crates/." "$NEW_ROOT/crates/"
+          cp "$UPSTREAM_WORKTREE/rust/Cargo.toml" /tmp/op-reth-sync-upstream-Cargo.toml
+
+          (cd "$OLD_ROOT" && find . -type f | sed 's#^[.]/##' | sort) > /tmp/op-reth-sync-files-old.txt
+          (cd "$NEW_ROOT" && find . -type f | sed 's#^[.]/##' | sort) > /tmp/op-reth-sync-files-new.txt
+          (cd op-reth && find bin crates -type f | sort) > /tmp/op-reth-sync-files-local.txt
+
+          while IFS= read -r rel; do
+            [ -n "$rel" ] || continue
+            OLD="$OLD_ROOT/$rel"
+            NEW="$NEW_ROOT/$rel"
+            LOCAL="op-reth/$rel"
+
+            if [ ! -e "$OLD" ] && [ ! -e "$NEW" ]; then
+              continue
+            fi
+
+            if [ ! -e "$OLD" ] && [ -e "$NEW" ]; then
+              mkdir -p "$(dirname "$LOCAL")"
+              cp -a "$NEW" "$LOCAL"
+              continue
+            fi
+
+            if [ -e "$OLD" ] && [ ! -e "$NEW" ]; then
+              if [ -e "$LOCAL" ] && ! diff -q "$LOCAL" "$OLD" >/dev/null 2>&1; then
+                echo "$LOCAL (upstream deleted, local modified)" >> /tmp/op-reth-sync-manual-conflicts-info.txt
+              elif [ -e "$LOCAL" ]; then
+                rm -f "$LOCAL"
+              fi
+              continue
+            fi
+
+            if [ ! -e "$LOCAL" ]; then
+              mkdir -p "$(dirname "$LOCAL")"
+              cp -a "$NEW" "$LOCAL"
+              if ! diff -q "$OLD" "$NEW" >/dev/null 2>&1; then
+                echo "$LOCAL (local deleted, upstream modified; took upstream)" >> /tmp/op-reth-sync-manual-conflicts-info.txt
+              fi
+              continue
+            fi
+
+            if diff -q "$OLD" "$NEW" >/dev/null 2>&1; then
+              continue
+            fi
+
+            if is_binary "$OLD" || is_binary "$NEW" || is_binary "$LOCAL"; then
+              if diff -q "$LOCAL" "$OLD" >/dev/null 2>&1; then
+                cp -a "$NEW" "$LOCAL"
+              else
+                echo "$LOCAL (binary conflict: local and upstream both modified)" >> /tmp/op-reth-sync-manual-conflicts-unresolved.txt
+              fi
+              continue
+            fi
+
+            set +e
+            git merge-file "$LOCAL" "$OLD" "$NEW"
+            merge_exit=$?
+            set -e
+
+            if [ "$merge_exit" -gt 0 ] && [ "$merge_exit" -lt 128 ]; then
+              echo "$LOCAL" >> /tmp/op-reth-sync-patch-conflicts.txt
+            elif [ "$merge_exit" -ge 128 ]; then
+              echo "$LOCAL (merge-file error, exit $merge_exit)" >> /tmp/op-reth-sync-manual-conflicts-unresolved.txt
+            fi
+          done < <(sort -u /tmp/op-reth-sync-files-old.txt /tmp/op-reth-sync-files-new.txt /tmp/op-reth-sync-files-local.txt)
+
+          marker_conflicts="$(wc -l < /tmp/op-reth-sync-patch-conflicts.txt | tr -d ' ')"
+          manual_info_conflicts="$(wc -l < /tmp/op-reth-sync-manual-conflicts-info.txt | tr -d ' ')"
+          manual_unresolved_conflicts="$(wc -l < /tmp/op-reth-sync-manual-conflicts-unresolved.txt | tr -d ' ')"
+          echo "::notice::Three-way merge complete: ${marker_conflicts} marker conflict(s), ${manual_info_conflicts} auto-resolved conflict(s), ${manual_unresolved_conflicts} unresolved manual conflict(s)"
+
+          local_revs="$(sed -nE '/paradigmxyz\/reth/ s/.*rev = "([0-9a-f]{40})".*/\1/p' Cargo.toml | sort -u || true)"
+          local_rev_count="$(printf "%s\n" "$local_revs" | grep -c '^[0-9a-f]' || true)"
+          if [ "$local_rev_count" -ne 1 ]; then
+            echo "::error::Expected one local reth rev, got ${local_rev_count}: ${local_revs}"
+            rev_extraction_failed=true
+          else
+            current_reth_rev="$local_revs"
+          fi
+
+          upstream_reth_rev="$(extract_reth_rev_from_file /tmp/op-reth-sync-upstream-Cargo.toml || true)"
+          if ! echo "$upstream_reth_rev" | grep -qE '^[0-9a-f]{40}$'; then
+            echo "::error::Failed to extract valid upstream reth rev: ${upstream_reth_rev}"
+            rev_extraction_failed=true
+          fi
+
+          sed -i -E "s#op-reth/v[0-9]+[.][0-9]+[.][0-9]+#${NEW_TAG}#g" Cargo.toml
+          if [ "$rev_extraction_failed" != "true" ] && [ "$current_reth_rev" != "$upstream_reth_rev" ]; then
+            sed -i "s/${current_reth_rev}/${upstream_reth_rev}/g" Cargo.toml
+            reth_rev_bumped=true
+
+            set +e
+            cargo update
+            cargo_update_exit=$?
+            set -e
+            if [ "$cargo_update_exit" -ne 0 ]; then
+              lock_update_failed=true
+            fi
+          fi
+
+          {
+            echo "### Mantle Fork Dependency Report"
+            echo
+            echo "| Dependency family | Current references |"
+            echo "|-------------------|--------------------|"
+            for repo in \
+              "mantle-xyz/revm" \
+              "mantle-xyz/revm-inspectors" \
+              "mantle-xyz/evm" \
+              "mantlenetworkio/mantle-v2"; do
+              refs="$(grep -RIn "$repo" Cargo.toml op-reth/bin/ op-reth/crates/ mantle-reth/ patches/ 2>/dev/null | sed 's/|/\\|/g' || true)"
+              if [ -z "$refs" ]; then
+                refs="_not found_"
+              else
+                refs="<details><summary>matches</summary><br><pre>${refs}</pre></details>"
+              fi
+              echo "| \`${repo}\` | ${refs} |"
+            done
+            echo
+            echo "Mantle fork dependencies are reported only. This workflow does not bump fork branches automatically."
+          } > /tmp/op-reth-sync-compat-report.txt
+
+          resolve_conflict_markers_with_claude "post-sync" || true
+
+          remaining_markers="$(grep -IRl '<<<<<<<' op-reth/bin/ op-reth/crates/ mantle-reth/ patches/ Cargo.toml Cargo.lock 2>/dev/null || true)"
+          if [ -n "$remaining_markers" ] || [ -s /tmp/op-reth-sync-manual-conflicts-unresolved.txt ]; then
+            has_unresolved_conflicts=true
+            validation_status="failed"
+            write_conflict_report
+          else
+            has_unresolved_conflicts=false
+          fi
+
+          stage_scoped_changes
+          if [ "$has_unresolved_conflicts" = "true" ]; then
+            commit_staged_if_needed "wip: unresolved op-reth sync conflicts from ${OLD_TAG} to ${NEW_TAG} (${DATE})" || true
+          else
+            commit_staged_if_needed "deps: sync op-reth from ${OLD_TAG} to ${NEW_TAG} (${DATE})" || true
+          fi
+
+          check_passed=1
+          test_build_passed=1
+          if [ "$has_unresolved_conflicts" != "true" ]; then
+            if run_claude_fix_loop "cargo-check" "$MAX_CHECK_ATTEMPTS" cargo check --workspace; then
+              check_passed=0
+            fi
+
+            stage_scoped_changes
+            commit_staged_if_needed "fix: resolve op-reth cargo check breakages (${DATE})" || true
+
+            if [ "$check_passed" -eq 0 ]; then
+              if run_claude_fix_loop "test-build" "$MAX_TEST_ATTEMPTS" cargo test --workspace --no-run; then
+                test_build_passed=0
+              fi
+
+              stage_scoped_changes
+              commit_staged_if_needed "fix: resolve op-reth test build breakages (${DATE})" || true
+            fi
+          fi
+
+          remaining_markers="$(grep -IRl '<<<<<<<' op-reth/bin/ op-reth/crates/ mantle-reth/ patches/ Cargo.toml Cargo.lock 2>/dev/null || true)"
+          if [ -n "$remaining_markers" ]; then
+            has_unresolved_conflicts=true
+          else
+            has_unresolved_conflicts=false
+          fi
+          if [ -s /tmp/op-reth-sync-manual-conflicts-unresolved.txt ]; then
+            has_unresolved_manual_conflicts=true
+          else
+            has_unresolved_manual_conflicts=false
+          fi
+          if [ -s /tmp/op-reth-sync-manual-conflicts-info.txt ]; then
+            has_manual_info=true
+          fi
+
+          set +e
+          cargo check --workspace 2>&1 | tee /tmp/op-reth-sync-final-cargo-check.log
+          check_passed=${PIPESTATUS[0]}
+          cargo test --workspace --no-run 2>&1 | tee /tmp/op-reth-sync-final-test-build.log
+          test_build_passed=${PIPESTATUS[0]}
+          set -e
+
+          if [ "$rev_extraction_failed" = "true" ] || [ "$has_unresolved_conflicts" = "true" ] || [ "$has_unresolved_manual_conflicts" = "true" ]; then
+            validation_status="failed"
+          elif [ "$check_passed" -eq 0 ] && [ "$test_build_passed" -eq 0 ]; then
+            validation_status="passed"
+          elif [ "$check_passed" -eq 0 ]; then
+            validation_status="partial"
+          else
+            validation_status="failed"
+          fi
+
+          if [ "$validation_status" = "failed" ] && { [ "$has_unresolved_conflicts" = "true" ] || [ "$has_unresolved_manual_conflicts" = "true" ]; }; then
+            write_conflict_report
+            stage_scoped_changes
+            commit_staged_if_needed "wip: record unresolved op-reth sync conflicts (${DATE})" || true
+          fi
+
+          if [ -n "$(git status --porcelain -- op-reth/ mantle-reth/ patches/ Cargo.toml Cargo.lock "$CONFLICT_REPORT" 2>/dev/null)" ]; then
+            stage_scoped_changes
+            commit_staged_if_needed "fix: finalize op-reth sync (${DATE})" || true
+          fi
+
+          forbidden_diff="$(git diff --name-only "$BASE_REF"...HEAD -- .op-reth-base-tag op-reth/ | grep -Ev '^(op-reth/(bin|crates)/)' || true)"
+          if [ -n "$forbidden_diff" ]; then
+            echo "::error::Forbidden out-of-scope files would appear in the PR diff:"
+            echo "$forbidden_diff"
+            exit 1
+          fi
+
+          if [ "$rev_extraction_failed" = "true" ]; then
+            failure_summary="${failure_summary}- reth rev extraction failed\n"
+          fi
+          if [ "$lock_update_failed" = "true" ]; then
+            failure_summary="${failure_summary}- cargo update failed; Cargo.lock may be stale\n"
+          fi
+          if [ "$has_unresolved_conflicts" = "true" ]; then
+            failure_summary="${failure_summary}- unresolved merge conflict markers remain\n"
+          fi
+          if [ "$has_unresolved_manual_conflicts" = "true" ]; then
+            failure_summary="${failure_summary}- unresolved manual structural conflicts remain\n"
+          fi
+          if [ "$check_passed" -ne 0 ]; then
+            failure_summary="${failure_summary}- cargo check failed\n"
+          fi
+          if [ "$test_build_passed" -ne 0 ]; then
+            failure_summary="${failure_summary}- cargo test --workspace --no-run failed\n"
+          fi
+          if [ "$validation_status" != "passed" ] && [ -z "$failure_summary" ]; then
+            failure_summary="- validation failed; inspect workflow logs\n"
+          fi
+
+          case "$validation_status" in
+            passed)
+              printf -v validation_section '%s\n' \
+                "### Validation Results" \
+                "- [x] Workspace compilation" \
+                "- [x] Workspace test build"
+              ;;
+            partial)
+              printf -v validation_section '%s\n' \
+                "### Validation Results" \
+                "- [x] Workspace compilation" \
+                "- [ ] Workspace test build"
+              ;;
+            *)
+              last_errors="$(tail -120 /tmp/op-reth-sync-final-cargo-check.log 2>/dev/null || true)"
+              printf -v validation_section '%s\n' \
+                "### Validation Results" \
+                "- [ ] Manual migration required" \
+                "" \
+                "Failure summary:" \
+                "$(printf "%b" "$failure_summary")" \
+                "" \
+                "<details><summary>Last cargo check output</summary>" \
+                "" \
+                '```' \
+                "${last_errors}" \
+                '```' \
+                "" \
+                "</details>"
+              ;;
+          esac
+
+          warnings=""
+          if [ "$rev_extraction_failed" = "true" ]; then
+            warnings="${warnings}\n- Rev extraction failed; reth rev bump was skipped or incomplete."
+          fi
+          if [ "$lock_update_failed" = "true" ]; then
+            warnings="${warnings}\n- cargo update failed; Cargo.lock may be stale."
+          fi
+          if [ "$has_unresolved_conflicts" = "true" ]; then
+            warnings="${warnings}\n- Unresolved conflict markers remain."
+          fi
+          if [ "$has_unresolved_manual_conflicts" = "true" ]; then
+            warnings="${warnings}\n- Unresolved manual structural conflicts require human resolution."
+          fi
+          if [ "$has_manual_info" = "true" ]; then
+            warnings="${warnings}\n- Auto-resolved structural conflicts present; review recommended."
+          fi
+
+          title="deps: sync op-reth ${OLD_TAG} -> ${NEW_TAG} (${DATE})"
+          {
+            echo "## Automated op-reth Sync"
+            echo
+            echo "Automated fixed-branch workflow. It updates one reusable branch and PR instead of creating a new branch for each run."
+            echo
+            echo "**Base branch:** \`${BASE_BRANCH}\` at \`${BASE_SHA:0:7}\`"
+            echo
+            echo "### Scope"
+            echo "- Synced upstream paths: \`rust/op-reth/bin/**\`, \`rust/op-reth/crates/**\`"
+            echo "- Local paths: \`op-reth/bin/\`, \`op-reth/crates/\`"
+            echo "- Excluded from PR scope: \`op-reth/examples/\`, \`op-reth/tests/\`, and other upstream-only project files"
+            echo "- State file policy: \`.op-reth-base-tag\` may be read as a fallback but is never staged as a PR artifact"
+            echo
+            echo "### Upstream op-reth Changes"
+            echo "[Compare: ${OLD_TAG}...${NEW_TAG}](https://github.com/ethereum-optimism/optimism/compare/${OLD_TAG}...${NEW_TAG})"
+            echo
+            echo "### Reth Core Rev"
+            if [ "$reth_rev_bumped" = "true" ]; then
+              echo "Bumped from \`${current_reth_rev:0:7}\` to \`${upstream_reth_rev:0:7}\` ([compare](https://github.com/paradigmxyz/reth/compare/${current_reth_rev}...${upstream_reth_rev}))"
+            elif [ -n "${current_reth_rev:-}" ]; then
+              echo "Unchanged or skipped (\`${current_reth_rev:0:7}\`)."
+            else
+              echo "Skipped; local rev could not be extracted."
+            fi
+            echo
+            cat /tmp/op-reth-sync-compat-report.txt
+            echo
+            printf "%s\n" "$validation_section"
+            echo
+            if [ -s /tmp/op-reth-sync-patch-conflicts.txt ]; then
+              echo "### Marker Conflicts"
+              echo
+              echo '```'
+              cat /tmp/op-reth-sync-patch-conflicts.txt
+              echo '```'
+              echo
+            fi
+            if [ -s /tmp/op-reth-sync-manual-conflicts-unresolved.txt ]; then
+              echo "### Manual Conflicts"
+              echo
+              echo '```'
+              cat /tmp/op-reth-sync-manual-conflicts-unresolved.txt
+              echo '```'
+              echo
+            fi
+            if [ -s /tmp/op-reth-sync-manual-conflicts-info.txt ]; then
+              echo "### Auto-Resolved Structural Changes"
+              echo
+              echo '```'
+              cat /tmp/op-reth-sync-manual-conflicts-info.txt
+              echo '```'
+              echo
+            fi
+            if [ -s /tmp/op-reth-sync-claude-summary.txt ]; then
+              echo "### Claude Fix Loop"
+              echo
+              echo '```'
+              cat /tmp/op-reth-sync-claude-summary.txt
+              echo '```'
+              echo
+            fi
+            if [ -n "$warnings" ]; then
+              echo "### Workflow Warnings"
+              printf "%b\n" "$warnings"
+              echo
+            fi
+            if [ -f "$CONFLICT_REPORT" ]; then
+              echo "### Conflict Report"
+              echo "A conflict report is committed at \`${CONFLICT_REPORT}\`."
+              echo
+            fi
+            echo "---"
+            echo "Generated by sync-upstream workflow run ${GITHUB_RUN_NUMBER:-local}."
+          } > /tmp/op-reth-sync-pr-body.txt
+
+          build_artifacts
+
+          if git diff --quiet "$BASE_REF"...HEAD; then
+            echo "::notice::No PR diff after syncing ${OLD_TAG} -> ${NEW_TAG}"
+            cat /tmp/op-reth-sync-pr-body.txt
+            send_lark "op-reth sync: no PR diff" "No PR diff after ${OLD_TAG} -> ${NEW_TAG} on ${BASE_BRANCH}."
+            workflow_completed=true
+            exit 0
+          fi
+
+          if [ "$DRY_RUN" = "true" ]; then
+            echo "::notice::dry_run=true; skipping push and PR creation"
+            cat /tmp/op-reth-sync-pr-body.txt
+            send_lark "op-reth sync dry run" "Dry run completed for ${OLD_TAG} -> ${NEW_TAG} on ${BASE_BRANCH}. Validation: ${validation_status}."
+            workflow_completed=true
+            exit 0
+          fi
+
+          git push origin "$BRANCH_NAME" --force-with-lease
+
+          existing_pr="$(gh pr list --head "$BRANCH_NAME" --base "$BASE_BRANCH" --json number --jq '.[0].number // empty')"
+          if [ -n "$existing_pr" ]; then
+            gh pr edit "$existing_pr" --title "$title" --body-file /tmp/op-reth-sync-pr-body.txt
+          else
+            if [ "$validation_status" = "passed" ]; then
+              gh pr create \
+                --base "$BASE_BRANCH" \
+                --head "$BRANCH_NAME" \
+                --title "$title" \
+                --body-file /tmp/op-reth-sync-pr-body.txt \
+                --label "A-dependencies"
+            else
+              gh pr create \
+                --base "$BASE_BRANCH" \
+                --head "$BRANCH_NAME" \
+                --title "$title" \
+                --body-file /tmp/op-reth-sync-pr-body.txt \
+                --label "A-dependencies,needs-manual-migration" \
+                --draft
+            fi
+          fi
+
+          pr_number="$(gh pr view "$BRANCH_NAME" --json number --jq '.number' 2>/dev/null || echo "")"
+          if [ -n "$pr_number" ]; then
+            if [ "$validation_status" = "passed" ]; then
+              gh pr ready "$pr_number" 2>/dev/null || true
+              gh pr edit "$pr_number" --remove-label "blocked,needs-manual-migration" 2>/dev/null || true
+              gh pr edit "$pr_number" --add-label "A-dependencies" 2>/dev/null || true
+            else
+              gh pr edit "$pr_number" --add-label "A-dependencies,needs-manual-migration" 2>/dev/null || true
+              pr_node_id="$(gh pr view "$pr_number" --json id --jq '.id' 2>/dev/null || echo "")"
+              if [ -n "$pr_node_id" ]; then
+                gh api graphql \
+                  -f query='mutation($id: ID!) { convertPullRequestToDraft(input: {pullRequestId: $id}) { pullRequest { isDraft } } }' \
+                  -f id="$pr_node_id" 2>/dev/null || true
+              fi
+            fi
+          fi
+
+          pr_url="$(gh pr view "$BRANCH_NAME" --json url --jq '.url' 2>/dev/null || echo "")"
+          if [ "$validation_status" = "passed" ]; then
+            send_lark "op-reth sync PR ready" "PR #${pr_number}: ${pr_url}\n${OLD_TAG} -> ${NEW_TAG}\nValidation: passed."
+          else
+            send_lark "op-reth sync needs review" "PR #${pr_number}: ${pr_url}\n${OLD_TAG} -> ${NEW_TAG}\nValidation: ${validation_status}."
+          fi
+          workflow_completed=true
+      - name: Upload workflow artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: op-reth-sync-artifacts
+          path: .op-reth-sync-artifacts/**
+          if-no-files-found: ignore
+          include-hidden-files: true
