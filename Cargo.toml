@@ -375,6 +375,7 @@ zstd = "0.13"
 bytes = { version = "1.11.1", default-features = false }
 cfg-if = "1.0.4"
 clap = { version = "4", features = ["derive"] }
+crossbeam-channel = "0.5.15"
 derive_more = { version = "2.0", default-features = false }
 either = "1"
 eyre = "0.6"
