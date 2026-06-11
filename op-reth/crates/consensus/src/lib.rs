@@ -881,6 +881,7 @@ mod tests {
                 &block,
                 &result,
                 Some((unstripped_root, bloom)),
+                None,
             );
         assert!(post_exec.is_ok(), "Mantle should ignore pre-computed receipt root: {post_exec:?}");
 
@@ -893,6 +894,7 @@ mod tests {
                 &block,
                 &result,
                 Some((unstripped_root, bloom)),
+                None,
             );
         assert!(
             post_exec_op.is_err(),
