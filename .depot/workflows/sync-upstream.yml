@@ -165,7 +165,9 @@ jobs:
           }
 
           is_binary() {
-            LC_ALL=C head -c 8000 "$1" | grep -qP '\x00'
+            local mime
+            mime="$(file --brief --mime-encoding "$1" 2>/dev/null || echo "unknown")"
+            [[ "$mime" == "binary" || "$mime" == "unknown" ]]
           }
 
           stage_scoped_changes() {
@@ -499,7 +501,14 @@ jobs:
             if [ "$merge_exit" -gt 0 ] && [ "$merge_exit" -lt 128 ]; then
               echo "$LOCAL" >> /tmp/op-reth-sync-patch-conflicts.txt
             elif [ "$merge_exit" -ge 128 ]; then
-              echo "$LOCAL (merge-file error, exit $merge_exit)" >> /tmp/op-reth-sync-manual-conflicts-unresolved.txt
+              if diff -q "$LOCAL" "$OLD" >/dev/null 2>&1; then
+                cp -a "$NEW" "$LOCAL"
+                echo "$LOCAL (merge-file failed; local==old, took upstream)" >> /tmp/op-reth-sync-manual-conflicts-info.txt
+              elif diff -q "$LOCAL" "$NEW" >/dev/null 2>&1; then
+                echo "$LOCAL (merge-file failed; local==new, kept)" >> /tmp/op-reth-sync-manual-conflicts-info.txt
+              else
+                echo "$LOCAL (merge-file error, exit $merge_exit)" >> /tmp/op-reth-sync-manual-conflicts-unresolved.txt
+              fi
             fi
           done < <(sort -u /tmp/op-reth-sync-files-old.txt /tmp/op-reth-sync-files-new.txt /tmp/op-reth-sync-files-local.txt)
 
