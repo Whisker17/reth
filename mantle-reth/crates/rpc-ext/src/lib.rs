@@ -386,7 +386,7 @@ where
             })?)
             .map_err(|e| ErrorObject::owned(-32000, format!("invalid request: {e}"), None::<()>))?,
             block_id,
-            None,
+            alloy_rpc_types_eth::state::EvmOverrides::default(),
         )
         .await
         .map_err(|e| {
