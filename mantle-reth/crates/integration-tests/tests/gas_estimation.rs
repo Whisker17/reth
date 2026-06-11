@@ -30,8 +30,8 @@ async fn estimate_gas_simple_transfer_via_rpc() {
             ..Default::default()
         })
         .with_rpc(RpcServerArgs::default().with_unused_ports().with_http());
-    config.network.discovery.discv5_port = 0;
-    config.network.discovery.discv5_port_ipv6 = 0;
+    config.network.discovery.discv5_port = Some(0);
+    config.network.discovery.discv5_port_ipv6 = Some(0);
 
     let db = create_test_rw_db_with_path(
         config
