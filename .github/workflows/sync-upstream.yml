@@ -567,6 +567,10 @@ jobs:
           resolve_conflict_markers_with_claude "post-sync" || true
 
           remaining_markers="$(grep -IRl '<<<<<<<' op-reth/bin/ op-reth/crates/ mantle-reth/ patches/ Cargo.toml Cargo.lock 2>/dev/null || true)"
+          has_text_markers=false
+          if [ -n "$remaining_markers" ]; then
+            has_text_markers=true
+          fi
           if [ -n "$remaining_markers" ] || [ -s /tmp/op-reth-sync-manual-conflicts-unresolved.txt ]; then
             has_unresolved_conflicts=true
             validation_status="failed"
@@ -584,7 +588,7 @@ jobs:
 
           check_passed=1
           test_build_passed=1
-          if [ "$has_unresolved_conflicts" != "true" ]; then
+          if [ "$has_text_markers" != "true" ]; then
             if run_claude_fix_loop "cargo-check" "$MAX_CHECK_ATTEMPTS" cargo check --workspace; then
               check_passed=0
             fi
