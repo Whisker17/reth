@@ -41,7 +41,7 @@ jobs:
       ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
       ANTHROPIC_BASE_URL: ${{ secrets.ANTHROPIC_BASE_URL }}
       LARK_WEBHOOK_URL: ${{ secrets.LARK_WEBHOOK_URL }}
-      BRANCH_NAME: op-reth-auto-bump
+      BRANCH_NAME: ""
       ARTIFACT_DIR: .op-reth-sync-artifacts
     steps:
       - name: Checkout
@@ -370,6 +370,11 @@ jobs:
             exit 1
           fi
 
+          # Generate unique branch name per run
+          tag_short="${NEW_TAG##*/}"
+          BRANCH_NAME="op-reth-sync-${tag_short}-$(date -u +%Y%m%d-%H%M%S)"
+          echo "Branch: ${BRANCH_NAME}"
+
           base_tag=""
           if git show "${BASE_REF}:Cargo.toml" > /tmp/op-reth-sync-base-Cargo.toml 2>/dev/null; then
             base_tag="$(extract_op_reth_tag_from_file /tmp/op-reth-sync-base-Cargo.toml || true)"
@@ -378,23 +383,7 @@ jobs:
             base_tag="$(git show "${BASE_REF}:.op-reth-base-tag" | tr -d '[:space:]')"
           fi
 
-          if [ "$DRY_RUN" = "true" ]; then
-            git switch -C "$BRANCH_NAME" "$BASE_REF"
-          elif git ls-remote --exit-code --heads origin "$BRANCH_NAME" >/dev/null 2>&1; then
-            git fetch origin "$BRANCH_NAME"
-            git switch -C "$BRANCH_NAME" "origin/${BRANCH_NAME}"
-            set +e
-            git rebase "$BASE_REF"
-            rebase_exit=$?
-            set -e
-            if [ "$rebase_exit" -ne 0 ]; then
-              echo "::warning::Rebase failed; restarting ${BRANCH_NAME} from ${BASE_BRANCH}"
-              git rebase --abort || true
-              git switch -C "$BRANCH_NAME" "$BASE_REF"
-            fi
-          else
-            git switch -C "$BRANCH_NAME" "$BASE_REF"
-          fi
+          git switch -C "$BRANCH_NAME" "$BASE_REF"
 
           current_tag="$(extract_op_reth_tag_from_file Cargo.toml || true)"
           if [ -z "$current_tag" ]; then
@@ -823,47 +812,26 @@ jobs:
             exit 0
           fi
 
-          git push origin "$BRANCH_NAME" --force-with-lease
+          git push origin "$BRANCH_NAME"
 
-          existing_pr="$(gh pr list --head "$BRANCH_NAME" --base "$BASE_BRANCH" --json number --jq '.[0].number // empty')"
-          if [ -n "$existing_pr" ]; then
-            gh pr edit "$existing_pr" --title "$title" --body-file /tmp/op-reth-sync-pr-body.txt
+          if [ "$validation_status" = "passed" ]; then
+            gh pr create \
+              --base "$BASE_BRANCH" \
+              --head "$BRANCH_NAME" \
+              --title "$title" \
+              --body-file /tmp/op-reth-sync-pr-body.txt \
+              --label "A-dependencies"
           else
-            if [ "$validation_status" = "passed" ]; then
-              gh pr create \
-                --base "$BASE_BRANCH" \
-                --head "$BRANCH_NAME" \
-                --title "$title" \
-                --body-file /tmp/op-reth-sync-pr-body.txt \
-                --label "A-dependencies"
-            else
-              gh pr create \
-                --base "$BASE_BRANCH" \
-                --head "$BRANCH_NAME" \
-                --title "$title" \
-                --body-file /tmp/op-reth-sync-pr-body.txt \
-                --label "A-dependencies,needs-manual-migration" \
-                --draft
-            fi
+            gh pr create \
+              --base "$BASE_BRANCH" \
+              --head "$BRANCH_NAME" \
+              --title "$title" \
+              --body-file /tmp/op-reth-sync-pr-body.txt \
+              --label "A-dependencies,needs-manual-migration" \
+              --draft
           fi
 
           pr_number="$(gh pr view "$BRANCH_NAME" --json number --jq '.number' 2>/dev/null || echo "")"
-          if [ -n "$pr_number" ]; then
-            if [ "$validation_status" = "passed" ]; then
-              gh pr ready "$pr_number" 2>/dev/null || true
-              gh pr edit "$pr_number" --remove-label "blocked,needs-manual-migration" 2>/dev/null || true
-              gh pr edit "$pr_number" --add-label "A-dependencies" 2>/dev/null || true
-            else
-              gh pr edit "$pr_number" --add-label "A-dependencies,needs-manual-migration" 2>/dev/null || true
-              pr_node_id="$(gh pr view "$pr_number" --json id --jq '.id' 2>/dev/null || echo "")"
-              if [ -n "$pr_node_id" ]; then
-                gh api graphql \
-                  -f query='mutation($id: ID!) { convertPullRequestToDraft(input: {pullRequestId: $id}) { pullRequest { isDraft } } }' \
-                  -f id="$pr_node_id" 2>/dev/null || true
-              fi
-            fi
-          fi
-
           pr_url="$(gh pr view "$BRANCH_NAME" --json url --jq '.url' 2>/dev/null || echo "")"
           if [ "$validation_status" = "passed" ]; then
             send_lark "op-reth sync PR ready" "PR #${pr_number}: ${pr_url}\n${OLD_TAG} -> ${NEW_TAG}\nValidation: passed."
