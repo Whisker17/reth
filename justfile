@@ -26,6 +26,9 @@ default:
 build:
   cargo build -p mantle-reth-cli --bin op-reth --features "{{FEATURES}}" --profile "{{PROFILE}}"
 
+# Alias: backward-compatible with old Makefile `make build-op`
+build-op: build
+
 # Build op-reth binary (debug, with Mantle state-export feature)
 build-debug:
   cargo build -p mantle-reth-cli --bin op-reth --features "{{MANTLE_DEBUG_FEATURES}}"
@@ -62,6 +65,12 @@ build-cross target:
   if [[ "{{target}}" == "x86_64-pc-windows-gnu" ]]; then
     features=$(echo "$features" | sed 's/jemalloc-prof//g; s/jemalloc//g' | xargs)
   fi
+  # Ubuntu 24.04 containers need:
+  # - LIBCLANG_PATH: use system clang-18, not cross's bundled libclang 3.8
+  #   libclang-dev installs libclang-18.so in /usr/lib/x86_64-linux-gnu/
+  # - BINDGEN_EXTRA_CLANG_ARGS: gcc-13 stdarg.h path (clang-18 package misses it)
+  # CROSS_CONTAINER_OPTS injects -e flags into docker run
+  export CROSS_CONTAINER_OPTS="${CROSS_CONTAINER_OPTS:--e LIBCLANG_PATH=/usr/lib/x86_64-linux-gnu -e BINDGEN_EXTRA_CLANG_ARGS=-I/usr/lib/gcc/x86_64-linux-gnu/13/include}"
   env "${env_args[@]}" \
     RUSTFLAGS="-C link-arg=-lgcc -Clink-arg=-static-libgcc" \
     cross build -p mantle-reth-cli --bin op-reth --target {{target}} --features "$features" --profile "{{PROFILE}}"
