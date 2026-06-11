@@ -19,6 +19,7 @@ use reth_ethereum_primitives as _;
 pub mod api;
 pub use api::{
     BlockStateDiff, OpProofsInitProvider, OpProofsProviderRO, OpProofsProviderRw, OpProofsStore,
+    ProofWindowRange,
 };
 
 pub mod initialize;
@@ -50,7 +51,8 @@ pub mod proof;
 
 pub mod provider;
 
-pub mod live;
+pub mod engine;
+pub use engine::EngineHandle;
 
 pub mod cursor;
 #[cfg(not(feature = "metrics"))]
