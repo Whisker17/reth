@@ -651,7 +651,7 @@ jobs:
             commit_staged_if_needed "fix: finalize op-reth sync (${DATE})" || true
           fi
 
-          forbidden_diff="$(git diff --name-only "$BASE_REF"...HEAD -- .op-reth-base-tag op-reth/ | grep -Ev '^(op-reth/(bin|crates)/)' || true)"
+          forbidden_diff="$(git diff --name-only "$BASE_REF"...HEAD -- op-reth/ | grep -Ev '^(op-reth/(bin|crates)/)' || true)"
           if [ -n "$forbidden_diff" ]; then
             echo "::error::Forbidden out-of-scope files would appear in the PR diff:"
             echo "$forbidden_diff"
