@@ -31,7 +31,7 @@ permissions:
 jobs:
   update-op-reth:
     name: Sync upstream op-reth
-    runs-on: ${{ vars.OP_RETH_AUTO_BUMP_RUNNER || 'ubuntu-latest' }}
+    runs-on: ${{ vars.OP_RETH_AUTO_BUMP_RUNNER || 'depot-ubuntu-24.04-32' }}
     timeout-minutes: 120
     env:
       BASE_BRANCH: ${{ inputs.base_branch }}
