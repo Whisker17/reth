@@ -101,6 +101,7 @@ jobs:
           current_reth_rev=""
           upstream_reth_rev=""
           failure_summary=""
+          ws_deps_added=0
 
           git config user.name "mantle-op-reth-auto-bump"
           git config user.email "actions@github.com"
@@ -185,6 +186,71 @@ jobs:
             if [ -f "$CONFLICT_REPORT" ]; then
               git add "$CONFLICT_REPORT"
             fi
+          }
+
+          sync_missing_workspace_deps() {
+            local upstream_cargo="$1"
+            ws_deps_added=0
+
+            local needed
+            needed="$(grep -rhE '^\s*[a-zA-Z0-9_-]+\s*(\.\s*workspace\s*=\s*true|=\s*\{[^}]*workspace\s*=\s*true)' \
+              op-reth/bin/ op-reth/crates/ 2>/dev/null \
+              | sed -E 's/^\s*([a-zA-Z0-9_-]+)\s*[.=].*/\1/' \
+              | sort -u || true)"
+            [ -n "$needed" ] || return 0
+
+            local missing=()
+            while IFS= read -r dep; do
+              [ -n "$dep" ] || continue
+              if ! grep -qE "^${dep}\s*[=.]" Cargo.toml; then
+                missing+=("$dep")
+              fi
+            done <<< "$needed"
+            [ "${#missing[@]}" -gt 0 ] || return 0
+
+            echo "::notice::Missing workspace deps: ${missing[*]}"
+
+            local lines_to_add=""
+            for dep in "${missing[@]}"; do
+              local decl
+              decl="$(awk -v dep="$dep" '
+                $0 ~ "^"dep"[[:space:]]*=" {
+                  buf = $0
+                  if (buf ~ /\{/ && buf !~ /\}/) {
+                    while ((getline nxt) > 0) {
+                      buf = buf "\n" nxt
+                      if (nxt ~ /\}/) break
+                    }
+                  }
+                  print buf
+                  exit
+                }
+              ' "$upstream_cargo")"
+
+              if [ -z "$decl" ]; then
+                echo "::warning::Dep '${dep}' not found in upstream Cargo.toml"
+                continue
+              fi
+
+              printf -v lines_to_add '%s%s\n' "$lines_to_add" "$decl"
+              echo "  Added workspace dep: ${dep}"
+              ((ws_deps_added++)) || true
+            done
+
+            [ -n "$lines_to_add" ] || return 0
+
+            local patch_ln
+            patch_ln="$(grep -n '^\[patch' Cargo.toml | head -n 1 | cut -d: -f1 || true)"
+            if [ -n "$patch_ln" ]; then
+              { head -n "$((patch_ln - 1))" Cargo.toml
+                printf '%s' "$lines_to_add"
+                tail -n "+${patch_ln}" Cargo.toml
+              } > /tmp/op-reth-cargo-ws-deps-tmp && mv /tmp/op-reth-cargo-ws-deps-tmp Cargo.toml
+            else
+              printf '\n%s' "$lines_to_add" >> Cargo.toml
+            fi
+
+            echo "::notice::Added ${ws_deps_added} workspace dep(s) from upstream"
           }
 
           write_conflict_report() {
@@ -533,10 +599,13 @@ jobs:
           fi
 
           sed -i -E "s#op-reth/v[0-9]+[.][0-9]+[.][0-9]+#${NEW_TAG}#g" Cargo.toml
+          sync_missing_workspace_deps /tmp/op-reth-sync-upstream-Cargo.toml
           if [ "$rev_extraction_failed" != "true" ] && [ "$current_reth_rev" != "$upstream_reth_rev" ]; then
             sed -i "s/${current_reth_rev}/${upstream_reth_rev}/g" Cargo.toml
             reth_rev_bumped=true
+          fi
 
+          if [ "$reth_rev_bumped" = "true" ] || [ "$ws_deps_added" -gt 0 ]; then
             set +e
             cargo update
             cargo_update_exit=$?
