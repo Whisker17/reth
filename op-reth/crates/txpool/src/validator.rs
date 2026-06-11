@@ -336,7 +336,7 @@ pub(crate) struct OpForkTracker {
 }
 
 impl OpForkTracker {
-    /// Returns `true` if Lagoon fork is activated.
+    /// Returns `true` if Interop fork is activated.
     pub(crate) fn is_interop_activated(&self) -> bool {
         self.interop.load(Ordering::Relaxed)
     }
